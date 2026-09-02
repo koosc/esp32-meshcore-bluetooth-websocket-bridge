@@ -12,6 +12,10 @@
 #include <BLEClient.h>
 #include <BLE2902.h>
 #include <BLESecurity.h>
+#if defined(CONFIG_NIMBLE_ENABLED)
+#include <host/ble_hs.h>
+#include <host/ble_store.h>
+#endif
 #include <Preferences.h>
 #include <vector>
 
@@ -22,8 +26,8 @@
 #define MESHCORE_RX_CHAR_UUID     "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 #define MESHCORE_TX_CHAR_UUID     "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
-#define WIFI_SSID                 "YOUR_WIFI_SSID"
-#define WIFI_PASS                 "YOUR_WIFI_PASSWORD"
+#define WIFI_SSID                 "NetworkNotFound"
+#define WIFI_PASS                 "allcapsnospaces"
 #define TCP_PORT                  5000
 #define WS_PORT                   5001
 #define HTTP_PORT                 80
@@ -50,6 +54,7 @@ static String configuredTargetMac = "";
 static uint32_t configuredPinCode = DEFAULT_BLE_PIN;
 static bool autoConnectEnabled = true;
 static bool bleScanning = false;
+static unsigned long scanStartTime = 0;
 
 static BLEAddress* pTargetAddress = nullptr;
 static BLEClient* pClient = nullptr;
@@ -85,6 +90,29 @@ static uint32_t tcpPacketsTx = 0;
 static uint32_t wsPacketsRx = 0;
 static uint32_t wsPacketsTx = 0;
 
+// Sanitize string for valid JSON output
+static String sanitizeJSONString(const String& input) {
+    String out = "";
+    out.reserve(input.length() + 8);
+    for (size_t i = 0; i < input.length(); i++) {
+        char c = input[i];
+        if (c == '"') {
+            out += "\\\"";
+        } else if (c == '\\') {
+            out += "\\\\";
+        } else if (c == '\n') {
+            out += "\\n";
+        } else if (c == '\r') {
+            out += "\\r";
+        } else if (c == '\t') {
+            out += "\\t";
+        } else if ((uint8_t)c >= 32 && (uint8_t)c <= 126) {
+            out += c;
+        }
+    }
+    return out;
+}
+
 // Forward declarations
 void startBLEScan(int durationSec = 5, bool clearList = false);
 bool connectToMeshCoreDevice();
@@ -93,9 +121,16 @@ void broadcastFrameToClients(const uint8_t* data, size_t len);
 String getDashboardHTML();
 String getStatusJSON();
 String getDevicesJSON();
+String getBondsJSON();
+void handleGetBonds();
+void handleClearBonds();
+void handleDeleteBond();
+void handleClearDiscoveredCache();
 void savePreferences();
 void loadPreferences();
 void forgetPreferences();
+
+static bool bleAuthCompleted = false;
 
 // ================= BLE Security Callbacks =================
 class BridgeSecurityCallbacks : public BLESecurityCallbacks {
@@ -118,6 +153,7 @@ class BridgeSecurityCallbacks : public BLESecurityCallbacks {
     void onAuthenticationComplete(ble_gap_conn_desc *desc) override {
         Serial.printf("[BLE SEC] Auth complete: enc=%d, auth=%d, bond=%d\n",
                       desc->sec_state.encrypted, desc->sec_state.authenticated, desc->sec_state.bonded);
+        bleAuthCompleted = true;
     }
 #endif
 };
@@ -163,8 +199,18 @@ static void onScanComplete(BLEScanResults scanResults) {
 class BridgeAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice advertisedDevice) override {
         String addr = advertisedDevice.getAddress().toString().c_str();
-        String name = advertisedDevice.getName().c_str();
+        String rawName = advertisedDevice.getName().c_str();
         int rssi = advertisedDevice.getRSSI();
+
+        // Sanitize name to ASCII printable characters
+        String name = "";
+        for (size_t i = 0; i < rawName.length(); i++) {
+            char c = rawName[i];
+            if ((uint8_t)c >= 32 && (uint8_t)c <= 126) {
+                name += c;
+            }
+        }
+        name.trim();
 
         bool hasUUID = advertisedDevice.isAdvertisingService(BLEUUID(MESHCORE_SERVICE_UUID));
         bool matchName = name.startsWith("MeshCore") ||
@@ -220,14 +266,18 @@ class BridgeAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
 };
 
 void startBLEScan(int durationSec, bool clearList) {
-    if (bleScanning) return;
+    BLEScan* pScan = BLEDevice::getScan();
+    if (pScan->isScanning()) {
+        pScan->stop();
+        delay(50);
+    }
     if (clearList) {
         discoveredDevices.clear();
     }
     Serial.printf("[BLE] Starting background scan for %d seconds...\n", durationSec);
-    BLEScan* pScan = BLEDevice::getScan();
     pScan->clearResults();
     bleScanning = true;
+    scanStartTime = millis();
     pScan->start(durationSec, onScanComplete, false);
 }
 
@@ -268,18 +318,25 @@ bool connectToMeshCoreDevice() {
     Serial.printf("[BLE] Connecting to %s (%s) with PIN %u...\n",
                   bleConnectedDeviceName.c_str(), pTargetAddress->toString().c_str(), blePinCode);
 
+#if defined(CONFIG_NIMBLE_ENABLED)
+    ble_hs_cfg.sm_io_cap = BLE_HS_IO_KEYBOARD_DISPLAY;
+    ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_mitm = 1;
+    ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_our_key_dist = BLE_HS_KEY_DIST_ENC_KEY | BLE_HS_KEY_DIST_ID_KEY;
+    ble_hs_cfg.sm_their_key_dist = BLE_HS_KEY_DIST_ENC_KEY | BLE_HS_KEY_DIST_ID_KEY;
+#endif
     BLESecurity::setPassKey(true, blePinCode);
 
-    if (pClient) {
-        if (pClient->isConnected()) {
-            pClient->disconnect();
-        }
-        delete pClient;
-        pClient = nullptr;
+    if (!pClient) {
+        pClient = BLEDevice::createClient();
+        pClient->setClientCallbacks(new BridgeClientCallbacks());
+    } else if (pClient->isConnected()) {
+        pClient->disconnect();
+        delay(100);
     }
 
-    pClient = BLEDevice::createClient();
-    pClient->setClientCallbacks(new BridgeClientCallbacks());
+    bleAuthCompleted = false;
 
     if (!pClient->connect(*pTargetAddress)) {
         Serial.println("[BLE] Connection failed.");
@@ -287,9 +344,25 @@ bool connectToMeshCoreDevice() {
         return false;
     }
 
-    Serial.println("[BLE] Setting MTU to 256...");
-    pClient->setMTU(256);
+    Serial.println("[BLE] Initiating MITM pairing security procedure...");
+#if defined(CONFIG_NIMBLE_ENABLED)
+    ble_gap_security_initiate(pClient->getConnId());
+#endif
 
+    // Wait for authentication & bonding to complete
+    unsigned long waitStart = millis();
+    while (!bleAuthCompleted && (millis() - waitStart < 5000)) {
+        httpServer.handleClient();
+        if (!pClient->isConnected()) {
+            Serial.println("[BLE] Disconnected during authentication.");
+            bleConnecting = false;
+            return false;
+        }
+        delay(50);
+    }
+    delay(300);
+
+    Serial.println("[BLE] Discovering NUS service & characteristics...");
     BLERemoteService* pRemoteService = pClient->getService(BLEUUID(MESHCORE_SERVICE_UUID));
     if (!pRemoteService) {
         Serial.println("[BLE] NUS Service not found.");
@@ -315,6 +388,7 @@ bool connectToMeshCoreDevice() {
     }
 
     if (pTxCharacteristic->canNotify()) {
+        Serial.println("[BLE] Subscribing to TX notifications...");
         pTxCharacteristic->registerForNotify(onBLETxNotify);
         Serial.println("[BLE] Subscribed to TX notifications successfully!");
     }
@@ -337,7 +411,7 @@ void sendFrameToMeshCore(const uint8_t* data, size_t len) {
 
     blePacketsTx++;
     Serial.printf("[BRIDGE -> BLE] Sending %d bytes to MeshCore (cmd 0x%02X)\n", len, data[0]);
-    pRxCharacteristic->writeValue((uint8_t*)data, len, true);
+    pRxCharacteristic->writeValue((uint8_t*)data, len, false);
 }
 
 // Wrap frame with MeshCore USB/TCP framing: '>' [len LSB] [len MSB] [payload]
@@ -399,6 +473,10 @@ void handleTCPClientData() {
                 tcpClient.print(resp);
             } else if (req.indexOf("GET /api/devices") >= 0) {
                 String json = getDevicesJSON();
+                String resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + String(json.length()) + "\r\nConnection: close\r\n\r\n" + json;
+                tcpClient.print(resp);
+            } else if (req.indexOf("GET /api/bonds") >= 0) {
+                String json = getBondsJSON();
                 String resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + String(json.length()) + "\r\nConnection: close\r\n\r\n" + json;
                 tcpClient.print(resp);
             } else {
@@ -490,16 +568,16 @@ String getStatusJSON() {
     json += "\"version\":\"" + String(BRIDGE_VERSION) + "\",";
     json += "\"ble_connected\":" + String(bleConnected ? "true" : "false") + ",";
     json += "\"ble_connecting\":" + String(bleConnecting ? "true" : "false") + ",";
-    json += "\"ble_device_name\":\"" + bleConnectedDeviceName + "\",";
-    json += "\"ble_mac\":\"" + bleConnectedAddress + "\",";
+    json += "\"ble_device_name\":\"" + sanitizeJSONString(bleConnectedDeviceName) + "\",";
+    json += "\"ble_mac\":\"" + sanitizeJSONString(bleConnectedAddress) + "\",";
     json += "\"ble_rssi\":" + String(bleLastRSSI) + ",";
     json += "\"ble_pin\":" + String(blePinCode) + ",";
     json += "\"ble_rx\":" + String(blePacketsRx) + ",";
     json += "\"ble_tx\":" + String(blePacketsTx) + ",";
-    json += "\"target_mac\":\"" + configuredTargetMac + "\",";
+    json += "\"target_mac\":\"" + sanitizeJSONString(configuredTargetMac) + "\",";
     json += "\"auto_conn\":" + String(autoConnectEnabled ? "true" : "false") + ",";
     json += "\"wifi_connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
-    json += "\"wifi_ssid\":\"" + String(WIFI_SSID) + "\",";
+    json += "\"wifi_ssid\":\"" + sanitizeJSONString(String(WIFI_SSID)) + "\",";
     json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
     json += "\"ip_address\":\"" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "") + "\",";
     json += "\"tcp_port\":" + String(TCP_PORT) + ",";
@@ -512,21 +590,74 @@ String getStatusJSON() {
 
 String getDevicesJSON() {
     String json = "{\"scanning\":" + String(bleScanning ? "true" : "false") + ",";
-    json += "\"target_mac\":\"" + configuredTargetMac + "\",";
+    json += "\"target_mac\":\"" + sanitizeJSONString(configuredTargetMac) + "\",";
     json += "\"pin\":" + String(blePinCode) + ",";
     json += "\"auto_conn\":" + String(autoConnectEnabled ? "true" : "false") + ",";
     json += "\"connected\":" + String(bleConnected ? "true" : "false") + ",";
-    json += "\"connected_mac\":\"" + (bleConnected ? bleConnectedAddress : "") + "\",";
-    json += "\"connected_name\":\"" + (bleConnected ? bleConnectedDeviceName : "") + "\",";
+    json += "\"connected_mac\":\"" + sanitizeJSONString(bleConnected ? bleConnectedAddress : "") + "\",";
+    json += "\"connected_name\":\"" + sanitizeJSONString(bleConnected ? bleConnectedDeviceName : "") + "\",";
     json += "\"devices\":[";
     for (size_t i = 0; i < discoveredDevices.size(); i++) {
         if (i > 0) json += ",";
         json += "{";
-        json += "\"address\":\"" + discoveredDevices[i].address + "\",";
-        json += "\"name\":\"" + discoveredDevices[i].name + "\",";
+        json += "\"address\":\"" + sanitizeJSONString(discoveredDevices[i].address) + "\",";
+        json += "\"name\":\"" + sanitizeJSONString(discoveredDevices[i].name) + "\",";
         json += "\"rssi\":" + String(discoveredDevices[i].rssi) + ",";
         json += "\"is_mesh\":" + String(discoveredDevices[i].isMeshCandidate ? "true" : "false") + ",";
         json += "\"connected\":" + String(bleConnected && bleConnectedAddress.equalsIgnoreCase(discoveredDevices[i].address) ? "true" : "false");
+        json += "}";
+    }
+    json += "]}";
+    return json;
+}
+
+struct StoredBond {
+    String address;
+    bool authenticated;
+    bool sc;
+    bool ltk_present;
+    bool irk_present;
+    uint8_t key_size;
+};
+
+static std::vector<StoredBond> getBondedPeersList() {
+    std::vector<StoredBond> list;
+#if defined(CONFIG_NIMBLE_ENABLED)
+    ble_store_iterate(BLE_STORE_OBJ_TYPE_PEER_SEC, [](int obj_type, union ble_store_value *val, void *cookie) -> int {
+        if (obj_type == BLE_STORE_OBJ_TYPE_PEER_SEC && val && cookie) {
+            auto* pList = (std::vector<StoredBond>*)cookie;
+            StoredBond b;
+            char addrStr[18];
+            snprintf(addrStr, sizeof(addrStr), "%02x:%02x:%02x:%02x:%02x:%02x",
+                     val->sec.peer_addr.val[5], val->sec.peer_addr.val[4],
+                     val->sec.peer_addr.val[3], val->sec.peer_addr.val[2],
+                     val->sec.peer_addr.val[1], val->sec.peer_addr.val[0]);
+            b.address = String(addrStr);
+            b.authenticated = val->sec.authenticated;
+            b.sc = val->sec.sc;
+            b.ltk_present = val->sec.ltk_present;
+            b.irk_present = val->sec.irk_present;
+            b.key_size = val->sec.key_size;
+            pList->push_back(b);
+        }
+        return 0;
+    }, &list);
+#endif
+    return list;
+}
+
+String getBondsJSON() {
+    std::vector<StoredBond> bonds = getBondedPeersList();
+    String json = "{\"bonds_count\":" + String(bonds.size()) + ",\"bonds\":[";
+    for (size_t i = 0; i < bonds.size(); i++) {
+        if (i > 0) json += ",";
+        json += "{";
+        json += "\"address\":\"" + sanitizeJSONString(bonds[i].address) + "\",";
+        json += "\"authenticated\":" + String(bonds[i].authenticated ? "true" : "false") + ",";
+        json += "\"sc\":" + String(bonds[i].sc ? "true" : "false") + ",";
+        json += "\"ltk_present\":" + String(bonds[i].ltk_present ? "true" : "false") + ",";
+        json += "\"irk_present\":" + String(bonds[i].irk_present ? "true" : "false") + ",";
+        json += "\"key_size\":" + String(bonds[i].key_size);
         json += "}";
     }
     json += "]}";
@@ -546,6 +677,56 @@ void handleStatusJSON() {
 void handleGetDevices() {
     httpServer.sendHeader("Access-Control-Allow-Origin", "*");
     httpServer.send(200, "application/json", getDevicesJSON());
+}
+
+void handleGetBonds() {
+    httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+    httpServer.send(200, "application/json", getBondsJSON());
+}
+
+void handleClearBonds() {
+    httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+    if (bleConnected && pClient) {
+        pClient->disconnect();
+        bleConnected = false;
+        bleConnecting = false;
+    }
+#if defined(CONFIG_NIMBLE_ENABLED)
+    ble_store_clear();
+#endif
+    Serial.println("[BLE SEC] Cleared all stored security bonds from keystore.");
+    httpServer.send(200, "application/json", "{\"status\":\"All security bonds cleared\"}");
+}
+
+void handleDeleteBond() {
+    httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+    String mac = httpServer.arg("mac");
+    if (mac.length() == 0) {
+        httpServer.send(400, "application/json", "{\"error\":\"Missing mac parameter\"}");
+        return;
+    }
+#if defined(CONFIG_NIMBLE_ENABLED)
+    BLEAddress bleAddr(mac.c_str());
+    uint8_t *native = bleAddr.getNative();
+    ble_addr_t addr;
+    for (int i = 0; i < 6; i++) {
+        addr.val[i] = native[5 - i];
+    }
+    addr.type = BLE_ADDR_PUBLIC;
+    ble_store_util_delete_peer(&addr);
+    addr.type = BLE_ADDR_RANDOM;
+    ble_store_util_delete_peer(&addr);
+#endif
+    Serial.printf("[BLE SEC] Deleted stored bond for %s\n", mac.c_str());
+    httpServer.send(200, "application/json", "{\"status\":\"Bond deleted\",\"address\":\"" + sanitizeJSONString(mac) + "\"}");
+}
+
+void handleClearDiscoveredCache() {
+    httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+    discoveredDevices.clear();
+    BLEDevice::getScan()->clearResults();
+    Serial.println("[SCAN] Cleared discovered devices cache.");
+    httpServer.send(200, "application/json", "{\"status\":\"Discovered devices cache cleared\"}");
 }
 
 void handleStartScan() {
@@ -573,7 +754,8 @@ void handleConnect() {
     }
 
     blePinCode = pin > 0 ? pin : DEFAULT_BLE_PIN;
-    BLESecurity::setPassKey(true, blePinCode);
+    BLESecurity sec;
+    sec.setPassKey(true, blePinCode);
 
     if (save) {
         configuredTargetMac = address;
@@ -808,6 +990,27 @@ String getDashboardHTML() {
     html += "<div id='connFeedback' style='margin-top:10px; font-size:13px; font-family:monospace; min-height:20px;'></div>";
     html += "</div>"; // End Card
 
+    // Card: Bluetooth Security Keystore & Cache Management
+    html += "<div class='card'>";
+    html += "<div style='display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;'>";
+    html += "<div class='card-title' style='margin-bottom:0;'>🗄️ Bluetooth Keystore & Bonding Cache</div>";
+    html += "<div style='display:flex; gap:8px;'>";
+    html += "<button class='btn btn-blue' onclick='fetchBonds()'>🔄 Refresh Keystore</button>";
+    html += "<button class='btn btn-red' onclick='clearAllBonds()'>🗑️ Clear All Stored Bonds</button>";
+    html += "</div></div>";
+    html += "<div style='font-size:12px; color:#8b949e; margin-bottom:12px;'>";
+    html += "The Bluetooth security keystore holds authenticated pairing keys and bonding records in NVS. If you change a device PIN or experience encryption status 261 errors, clearing the bond cache forces fresh PIN negotiation.";
+    html += "</div>";
+    html += "<div id='bondsList' style='display:flex; flex-direction:column; gap:8px;'>";
+    html += "<div style='padding:15px; text-align:center; color:#8b949e;'>Loading bonded devices keystore...</div>";
+    html += "</div>";
+    html += "<div style='margin-top:14px; padding-top:12px; border-top:1px solid #30363d; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;'>";
+    html += "<span style='font-size:12px; color:#8b949e;'>Scanner Cache: <b id='scanCacheCount'>0</b> device(s) in memory</span>";
+    html += "<button class='btn' style='padding:4px 10px; font-size:12px;' onclick='clearDiscoveredCache()'>🧹 Clear Scanner Cache</button>";
+    html += "</div>";
+    html += "<div id='cacheFeedback' style='margin-top:8px; font-size:13px; font-family:monospace; min-height:18px;'></div>";
+    html += "</div>"; // End Card Keystore
+
     html += "</div>"; // End tabConfig
 
     // Client-side JavaScript
@@ -815,6 +1018,8 @@ String getDashboardHTML() {
     html += "let ws = null;";
     html += "let myNodeName = 'BridgeWeb';";
     html += "let devicesList = [];";
+    html += "let bondsList = [];";
+    html += "let configPollInterval = null;";
     html += "const logBox = document.getElementById('logBox');";
     html += "const chatBox = document.getElementById('chatBox');";
 
@@ -823,16 +1028,90 @@ String getDashboardHTML() {
     html += "  document.getElementById('tabConfig').style.display = tab === 'config' ? 'flex' : 'none';";
     html += "  document.getElementById('btnTabConsole').className = 'btn ' + (tab === 'console' ? 'btn-primary' : '');";
     html += "  document.getElementById('btnTabConfig').className = 'btn ' + (tab === 'config' ? 'btn-primary' : '');";
-    html += "  if (tab === 'config') { fetchDevices(); }";
+    html += "  if (tab === 'config') {";
+    html += "    fetchDevices();";
+    html += "    fetchBonds();";
+    html += "    if (!configPollInterval) configPollInterval = setInterval(() => { fetchDevices(); fetchBonds(); }, 3000);";
+    html += "  } else {";
+    html += "    if (configPollInterval) { clearInterval(configPollInterval); configPollInterval = null; }";
+    html += "  }";
+    html += "}";
+
+    html += "function fetchBonds() {";
+    html += "  fetch('/api/bonds').then(r => r.json()).then(d => {";
+    html += "    bondsList = d.bonds || [];";
+    html += "    renderBonds();";
+    html += "  }).catch(e => {";
+    html += "    console.error('fetchBonds error:', e);";
+    html += "    document.getElementById('bondsList').innerHTML = `<div style='color:#da3633; text-align:center; padding:10px;'>Failed to load keystore: ${e}</div>`;";
+    html += "  });";
+    html += "}";
+
+    html += "function renderBonds() {";
+    html += "  const el = document.getElementById('bondsList');";
+    html += "  if (bondsList.length === 0) {";
+    html += "    el.innerHTML = '<div style=\"padding:15px; text-align:center; color:#8b949e;\">No stored bonding keys found in keystore.</div>';";
+    html += "    return;";
+    html += "  }";
+    html += "  let html = '';";
+    html += "  bondsList.forEach(b => {";
+    html += "    const authTag = b.authenticated ? '<span class=\"badge bg-green\">MITM Authenticated</span>' : '<span class=\"badge bg-yellow\">Unauthenticated (JustWorks)</span>';";
+    html += "    const scTag = b.sc ? '<span class=\"badge bg-green\">Secure Conn</span>' : '<span class=\"badge\" style=\"background:#30363d; color:#8b949e;\">Legacy Sec</span>';";
+    html += "    const ltkTag = b.ltk_present ? '<span class=\"badge\" style=\"background:#1f6feb; color:#fff;\">LTK Bond</span>' : '';";
+    html += "    const irkTag = b.irk_present ? '<span class=\"badge\" style=\"background:#6f42c1; color:#fff;\">IRK Identity</span>' : '';";
+    html += "    html += `<div style=\"background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:10px 14px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;\">`;";
+    html += "    html += `<div><div style=\"font-family:monospace; font-weight:bold; font-size:14px; color:#f0f6fc;\">${b.address}</div>`;";
+    html += "    html += `<div style=\"display:flex; gap:6px; margin-top:5px; flex-wrap:wrap;\">${authTag} ${scTag} ${ltkTag} ${irkTag} <span class=\"badge\" style=\"background:#21262d; color:#8b949e;\">Key: ${b.key_size * 8} bits</span></div></div>`;";
+    html += "    html += `<button class=\"btn btn-red\" style=\"padding:4px 10px; font-size:12px;\" onclick=\"deleteBond('${b.address}')\">Delete Bond 🗑️</button>`;";
+    html += "    html += `</div>`;";
+    html += "  });";
+    html += "  el.innerHTML = html;";
+    html += "}";
+
+    html += "function deleteBond(mac) {";
+    html += "  if (!confirm(`Delete bonding key for ${mac} from keystore?`)) return;";
+    html += "  const fb = document.getElementById('cacheFeedback');";
+    html += "  fb.innerHTML = `<span style=\"color:#d29922;\">Deleting bond for ${mac}...</span>`;";
+    html += "  const params = new URLSearchParams();";
+    html += "  params.append('mac', mac);";
+    html += "  fetch('/api/bonds/delete', { method: 'POST', body: params }).then(r => r.json()).then(d => {";
+    html += "    fb.innerHTML = `<span style=\"color:#3fb950;\">Bond deleted for ${mac}.</span>`;";
+    html += "    fetchBonds();";
+    html += "  }).catch(e => {";
+    html += "    fb.innerHTML = `<span style=\"color:#da3633;\">Error deleting bond: ${e}</span>`;";
+    html += "  });";
+    html += "}";
+
+    html += "function clearAllBonds() {";
+    html += "  if (!confirm('Clear ALL stored security bonds from keystore? This will disconnect any active BLE connection.')) return;";
+    html += "  const fb = document.getElementById('cacheFeedback');";
+    html += "  fb.innerHTML = '<span style=\"color:#d29922;\">Clearing security keystore...</span>';";
+    html += "  fetch('/api/bonds/clear', { method: 'POST' }).then(r => r.json()).then(d => {";
+    html += "    fb.innerHTML = '<span style=\"color:#3fb950;\">All security bonds successfully erased from keystore.</span>';";
+    html += "    fetchBonds();";
+    html += "    checkStatus();";
+    html += "  }).catch(e => {";
+    html += "    fb.innerHTML = `<span style=\"color:#da3633;\">Error clearing keystore: ${e}</span>`;";
+    html += "  });";
+    html += "}";
+
+    html += "function clearDiscoveredCache() {";
+    html += "  fetch('/api/cache/clear-devices', { method: 'POST' }).then(r => r.json()).then(d => {";
+    html += "    document.getElementById('cacheFeedback').innerHTML = '<span style=\"color:#3fb950;\">Discovered devices cache cleared.</span>';";
+    html += "    devicesList = [];";
+    html += "    renderDevices();";
+    html += "  });";
     html += "}";
 
     html += "function fetchDevices() {";
     html += "  fetch('/api/devices').then(r => r.json()).then(d => {";
     html += "    devicesList = d.devices || [];";
-    html += "    if (d.target_mac && !document.getElementById('cfgTargetMac').value) {";
-    html += "      document.getElementById('cfgTargetMac').value = d.target_mac;";
+    html += "    const targetInput = document.getElementById('cfgTargetMac');";
+    html += "    if (d.target_mac && !targetInput.value) {";
+    html += "      targetInput.value = d.target_mac;";
     html += "    }";
-    html += "    if (d.pin) document.getElementById('cfgPin').value = d.pin;";
+    html += "    const pinInput = document.getElementById('cfgPin');";
+    html += "    if (d.pin && !pinInput.dataset.userEdited) pinInput.value = d.pin;";
     html += "    if (typeof d.auto_conn !== 'undefined') document.getElementById('cfgAuto').checked = d.auto_conn;";
     html += "    renderDevices();";
     html += "    const btn = document.getElementById('scanBtn');";
@@ -843,17 +1122,20 @@ String getDashboardHTML() {
     html += "      btn.textContent = '🔍 Scan for Devices';";
     html += "      btn.disabled = false;";
     html += "    }";
-    html += "  }).catch(e => console.error(e));";
+    html += "  }).catch(e => console.error('fetchDevices error:', e));";
     html += "}";
 
     html += "function startScan() {";
     html += "  const btn = document.getElementById('scanBtn');";
     html += "  btn.textContent = '⏳ Scanning...';";
     html += "  btn.disabled = true;";
+    html += "  document.getElementById('scanSummary').textContent = 'Scanning for nearby Bluetooth devices...';";
     html += "  fetch('/api/scan', { method: 'POST' }).then(() => {";
-    html += "    setTimeout(fetchDevices, 1200);";
-    html += "    setTimeout(fetchDevices, 3200);";
-    html += "    setTimeout(fetchDevices, 5500);";
+    html += "    fetchDevices();";
+    html += "  }).catch(e => {";
+    html += "    console.error('Scan error:', e);";
+    html += "    btn.textContent = '🔍 Scan for Devices';";
+    html += "    btn.disabled = false;";
     html += "  });";
     html += "}";
 
@@ -864,7 +1146,7 @@ String getDashboardHTML() {
     html += "  const meshCount = devicesList.filter(d => d.is_mesh).length;";
     html += "  document.getElementById('scanSummary').textContent = `Found ${devicesList.length} device(s) (${meshCount} MeshCore candidate(s))`;";
     html += "  if (filtered.length === 0) {";
-    html += "    listEl.innerHTML = `<div style='padding:20px; text-align:center; color:#8b949e;'>${devicesList.length > 0 ? 'No MeshCore devices found. Check \"Show all Bluetooth devices\" to see all ' + devicesList.length + ' nearby devices.' : 'No devices found. Click \"Scan for Devices\" above.'}</div>`;";
+    html += "    listEl.innerHTML = `<div style='padding:20px; text-align:center; color:#8b949e;'>${devicesList.length > 0 ? 'No MeshCore devices match candidate filter. Check \"Show all Bluetooth devices\" to see all ' + devicesList.length + ' nearby devices.' : 'No devices found yet. Click \"Scan for Devices\" above.'}</div>`;";
     html += "    return;";
     html += "  }";
     html += "  filtered.sort((a,b) => b.rssi - a.rssi);";
@@ -874,24 +1156,26 @@ String getDashboardHTML() {
     html += "    const name = d.name || 'Unnamed Device';";
     html += "    const tag = d.is_mesh ? `<span class='badge bg-green'>MeshCore / NUS</span>` : `<span class='badge' style='background:#30363d; color:#8b949e;'>Generic BLE</span>`;";
     html += "    const rssiColor = d.rssi > -70 ? '#3fb950' : (d.rssi > -85 ? '#d29922' : '#da3633');";
-    html += "    html += `<div class='device-card ${isConn ? \"device-connected\" : \"\"}' onclick='selectDevice(\"${d.address}\", \"${name}\")'>`;";
+    html += "    const encName = encodeURIComponent(name);";
+    html += "    html += `<div class='device-card ${isConn ? \"device-connected\" : \"\"}' onclick='selectDevice(\"${d.address}\", \"${encName}\")'>`;";
     html += "    html += `<div style='display:flex; justify-content:space-between; align-items:center;'><div>`;";
     html += "    html += `<div style='font-weight:600; font-size:14px; color:#f0f6fc; display:flex; align-items:center; gap:8px;'>${d.is_mesh ? '📻' : '📱'} ${name} ${tag} ${isConn ? '<span class=\"badge bg-green\">Active</span>' : ''}</div>`;";
     html += "    html += `<div style='font-family:monospace; font-size:12px; color:#8b949e; margin-top:3px;'>${d.address}</div></div>`;";
     html += "    html += `<div style='text-align:right;'><span style='font-family:monospace; font-weight:bold; color:${rssiColor}; font-size:13px;'>${d.rssi} dBm</span>`;";
-    html += "    html += `<div style='margin-top:4px;'><button class='btn ${isConn ? \"btn-blue\" : \"btn-primary\"}' style='padding:4px 10px; font-size:12px;' onclick='event.stopPropagation(); selectAndConnect(\"${d.address}\", \"${name}\")'>${isConn ? 'Connected' : 'Connect 🔗'}</button></div>`;";
+    html += "    html += `<div style='margin-top:4px;'><button class='btn ${isConn ? \"btn-blue\" : \"btn-primary\"}' style='padding:4px 10px; font-size:12px;' onclick='event.stopPropagation(); selectAndConnect(\"${d.address}\", \"${encName}\")'>${isConn ? 'Connected' : 'Connect 🔗'}</button></div>`;";
     html += "    html += `</div></div></div>`;";
     html += "  });";
     html += "  listEl.innerHTML = html;";
     html += "}";
 
-    html += "function selectDevice(addr, name) {";
+    html += "function selectDevice(addr, encName) {";
+    html += "  const name = decodeURIComponent(encName || '');";
     html += "  document.getElementById('cfgTargetMac').value = addr;";
     html += "  document.getElementById('connFeedback').innerHTML = `<span style='color:#58a6ff;'>Selected: <b>${name || addr}</b> (${addr})</span>`;";
     html += "}";
 
-    html += "function selectAndConnect(addr, name) {";
-    html += "  selectDevice(addr, name);";
+    html += "function selectAndConnect(addr, encName) {";
+    html += "  selectDevice(addr, encName);";
     html += "  connectTarget();";
     html += "}";
 
@@ -1195,6 +1479,10 @@ void setup() {
     httpServer.on("/config", handleRoot);
     httpServer.on("/status", handleStatusJSON);
     httpServer.on("/api/devices", handleGetDevices);
+    httpServer.on("/api/bonds", handleGetBonds);
+    httpServer.on("/api/bonds/clear", handleClearBonds);
+    httpServer.on("/api/bonds/delete", handleDeleteBond);
+    httpServer.on("/api/cache/clear-devices", handleClearDiscoveredCache);
     httpServer.on("/api/scan", handleStartScan);
     httpServer.on("/api/connect", handleConnect);
     httpServer.on("/api/disconnect", handleDisconnect);
@@ -1207,12 +1495,13 @@ void setup() {
     BLEDevice::init("ESP32C3-MeshBridge");
     BLEDevice::setSecurityCallbacks(new BridgeSecurityCallbacks());
 
-    BLESecurity::setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
-    BLESecurity::setCapability(ESP_IO_CAP_KBDISP);
-    BLESecurity::setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
-    BLESecurity::setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
-    BLESecurity::setKeySize(16);
-    BLESecurity::setPassKey(true, blePinCode);
+    BLESecurity sec;
+    sec.setForceAuthentication(false);
+    sec.setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
+    sec.setCapability(ESP_IO_CAP_KBDISP);
+    sec.setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+    sec.setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+    sec.setPassKey(true, blePinCode);
 
     BLEScan* pBLEScan = BLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new BridgeAdvertisedDeviceCallbacks());
@@ -1276,6 +1565,13 @@ void loop() {
                 startBLEScan(5, false);
             }
         }
+    }
+
+    // Scan timeout watchdog
+    if (bleScanning && millis() - scanStartTime > 8000) {
+        Serial.println("[SCAN] Watchdog: scan timed out, resetting bleScanning");
+        BLEDevice::getScan()->stop();
+        bleScanning = false;
     }
 
     // 6. Periodic status print
