@@ -4,6 +4,7 @@
 #include <WiFiServer.h>
 #include <WebServer.h>
 #include <WebSocketsServer.h>
+#include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
@@ -20,14 +21,12 @@
 #include <vector>
 
 // ================= Configuration =================
-#define BRIDGE_VERSION            "1.4.0"
+#define BRIDGE_VERSION            "1.5.0"
 #define DEFAULT_BLE_PIN           808978
 #define MESHCORE_SERVICE_UUID     "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 #define MESHCORE_RX_CHAR_UUID     "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 #define MESHCORE_TX_CHAR_UUID     "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
-#define WIFI_SSID                 "NetworkNotFound"
-#define WIFI_PASS                 "allcapsnospaces"
 #define TCP_PORT                  5000
 #define WS_PORT                   5001
 #define HTTP_PORT                 80
@@ -49,6 +48,16 @@ struct DiscoveredDevice {
 // ================= State Variables =================
 static std::vector<DiscoveredDevice> discoveredDevices;
 static Preferences preferences;
+
+// Wi-Fi & Soft AP Portal State
+static String wifiSSID = "";
+static String wifiPass = "";
+static bool isAPMode = false;
+static String apSSID = "MeshCore-Bridge-Setup";
+static DNSServer dnsServer;
+static const byte DNS_PORT = 53;
+static bool wifiConnectPending = false;
+static bool wifiScanning = false;
 
 static String configuredTargetMac = "";
 static uint32_t configuredPinCode = DEFAULT_BLE_PIN;
@@ -122,13 +131,23 @@ String getDashboardHTML();
 String getStatusJSON();
 String getDevicesJSON();
 String getBondsJSON();
+String getWiFiScanJSON();
 void handleGetBonds();
 void handleClearBonds();
 void handleDeleteBond();
 void handleClearDiscoveredCache();
+void handleGetWiFiScan();
+void handleSaveWiFi();
+void handleForgetWiFi();
+void handleCaptivePortal();
 void savePreferences();
 void loadPreferences();
 void forgetPreferences();
+void saveWiFiPreferences(const String& ssid, const String& pass);
+void forgetWiFiPreferences();
+bool connectWiFi(const String& ssid, const String& pass, int timeoutSec = 12);
+void startAPMode();
+void stopAPMode();
 
 static bool bleAuthCompleted = false;
 
@@ -284,14 +303,16 @@ void startBLEScan(int durationSec, bool clearList) {
 // ================= Preferences (NVS) Storage =================
 void loadPreferences() {
     preferences.begin("mesh_bridge", false);
+    wifiSSID = preferences.getString("wifi_ssid", "");
+    wifiPass = preferences.getString("wifi_pass", "");
     configuredTargetMac = preferences.getString("target_mac", "");
     configuredPinCode = preferences.getUInt("pin_code", DEFAULT_BLE_PIN);
     autoConnectEnabled = preferences.getBool("auto_conn", true);
     preferences.end();
 
     blePinCode = configuredPinCode;
-    Serial.printf("[PREFS] Loaded Target MAC: '%s' | PIN: %u | AutoConnect: %d\n",
-                  configuredTargetMac.c_str(), configuredPinCode, autoConnectEnabled);
+    Serial.printf("[PREFS] Loaded WiFi: '%s' | Target MAC: '%s' | PIN: %u | AutoConnect: %d\n",
+                  wifiSSID.c_str(), configuredTargetMac.c_str(), configuredPinCode, autoConnectEnabled);
 }
 
 void savePreferences() {
@@ -304,12 +325,93 @@ void savePreferences() {
                   configuredTargetMac.c_str(), configuredPinCode, autoConnectEnabled);
 }
 
+void saveWiFiPreferences(const String& ssid, const String& pass) {
+    preferences.begin("mesh_bridge", false);
+    preferences.putString("wifi_ssid", ssid);
+    preferences.putString("wifi_pass", pass);
+    preferences.end();
+    wifiSSID = ssid;
+    wifiPass = pass;
+    Serial.printf("[PREFS] Saved WiFi SSID: '%s'\n", wifiSSID.c_str());
+}
+
+void forgetWiFiPreferences() {
+    preferences.begin("mesh_bridge", false);
+    preferences.remove("wifi_ssid");
+    preferences.remove("wifi_pass");
+    preferences.end();
+    wifiSSID = "";
+    wifiPass = "";
+    Serial.println("[PREFS] WiFi credentials forgotten.");
+}
+
 void forgetPreferences() {
     preferences.begin("mesh_bridge", false);
     preferences.remove("target_mac");
     preferences.end();
     configuredTargetMac = "";
     Serial.println("[PREFS] Target device forgotten.");
+}
+
+// ================= Wi-Fi & Soft AP Management =================
+bool connectWiFi(const String& ssid, const String& pass, int timeoutSec) {
+    if (ssid.length() == 0) return false;
+    Serial.printf("[WiFi] Connecting to '%s'...\n", ssid.c_str());
+    WiFi.disconnect();
+    delay(100);
+    WiFi.mode(isAPMode ? WIFI_AP_STA : WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(ssid.c_str(), pass.length() > 0 ? pass.c_str() : nullptr);
+
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start < (unsigned long)timeoutSec * 1000)) {
+        delay(250);
+        Serial.print(".");
+        if (isAPMode) {
+            dnsServer.processNextRequest();
+            httpServer.handleClient();
+        }
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("[WiFi] Connected! IP: %s | Gateway: %s | RSSI: %d dBm\n",
+                      WiFi.localIP().toString().c_str(),
+                      WiFi.gatewayIP().toString().c_str(),
+                      WiFi.RSSI());
+        return true;
+    }
+    Serial.printf("[WiFi] Connection to '%s' timed out.\n", ssid.c_str());
+    return false;
+}
+
+void startAPMode() {
+    if (isAPMode) return;
+    isAPMode = true;
+    WiFi.mode(WIFI_AP_STA);
+
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    char apName[32];
+    snprintf(apName, sizeof(apName), "MeshCore-Bridge-%02X%02X", mac[4], mac[5]);
+    apSSID = String(apName);
+
+    WiFi.softAP(apSSID.c_str());
+    IPAddress apIP = WiFi.softAPIP();
+    Serial.printf("[WiFi AP] Soft AP started: '%s' | Portal IP: %s\n", apSSID.c_str(), apIP.toString().c_str());
+
+    dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+    dnsServer.start(DNS_PORT, "*", apIP);
+    Serial.println("[DNS] Captive Portal DNS active (* -> 192.168.4.1)");
+}
+
+void stopAPMode() {
+    if (!isAPMode) return;
+    dnsServer.stop();
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    isAPMode = false;
+    Serial.println("[WiFi AP] Soft AP stopped. Running in Station mode.");
 }
 
 bool connectToMeshCoreDevice() {
@@ -577,14 +679,35 @@ String getStatusJSON() {
     json += "\"target_mac\":\"" + sanitizeJSONString(configuredTargetMac) + "\",";
     json += "\"auto_conn\":" + String(autoConnectEnabled ? "true" : "false") + ",";
     json += "\"wifi_connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
-    json += "\"wifi_ssid\":\"" + sanitizeJSONString(String(WIFI_SSID)) + "\",";
-    json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
-    json += "\"ip_address\":\"" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "") + "\",";
+    json += "\"is_ap_mode\":" + String(isAPMode ? "true" : "false") + ",";
+    json += "\"ap_ssid\":\"" + sanitizeJSONString(apSSID) + "\",";
+    json += "\"ap_ip\":\"" + (isAPMode ? WiFi.softAPIP().toString() : "") + "\",";
+    json += "\"wifi_ssid\":\"" + sanitizeJSONString(WiFi.status() == WL_CONNECTED ? WiFi.SSID() : wifiSSID) + "\",";
+    json += "\"wifi_rssi\":" + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0) + ",";
+    json += "\"ip_address\":\"" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : (isAPMode ? WiFi.softAPIP().toString() : "")) + "\",";
     json += "\"tcp_port\":" + String(TCP_PORT) + ",";
     json += "\"ws_port\":" + String(WS_PORT) + ",";
     json += "\"free_heap\":" + String(ESP.getFreeHeap()) + ",";
     json += "\"uptime_sec\":" + String(millis() / 1000);
     json += "}";
+    return json;
+}
+
+String getWiFiScanJSON() {
+    int n = WiFi.scanNetworks(false, false);
+    String json = "{\"count\":" + String(n >= 0 ? n : 0) + ",\"networks\":[";
+    if (n > 0) {
+        for (int i = 0; i < n; i++) {
+            if (i > 0) json += ",";
+            json += "{";
+            json += "\"ssid\":\"" + sanitizeJSONString(WiFi.SSID(i)) + "\",";
+            json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+            json += "\"secure\":" + String(WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false");
+            json += "}";
+        }
+        WiFi.scanDelete();
+    }
+    json += "]}";
     return json;
 }
 
@@ -802,6 +925,73 @@ void handleForget() {
     httpServer.send(200, "application/json", "{\"status\":\"Target forgotten\"}");
 }
 
+void handleGetWiFiScan() {
+    httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+    int16_t n = WiFi.scanComplete();
+    if (n == WIFI_SCAN_RUNNING) {
+        httpServer.send(200, "application/json", "{\"scanning\":true,\"count\":0,\"networks\":[]}");
+        return;
+    }
+    if (n >= 0) {
+        String json = "{\"scanning\":false,\"count\":" + String(n) + ",\"networks\":[";
+        for (int i = 0; i < n; i++) {
+            if (i > 0) json += ",";
+            json += "{";
+            json += "\"ssid\":\"" + sanitizeJSONString(WiFi.SSID(i)) + "\",";
+            json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+            json += "\"secure\":" + String(WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false");
+            json += "}";
+        }
+        json += "]}";
+        WiFi.scanDelete();
+        wifiScanning = false;
+        httpServer.send(200, "application/json", json);
+        return;
+    }
+    // Scan not active yet or failed, start asynchronous scan
+    wifiScanning = true;
+    WiFi.scanNetworks(true);
+    httpServer.send(200, "application/json", "{\"scanning\":true,\"count\":0,\"networks\":[]}");
+}
+
+void handleSaveWiFi() {
+    httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+    String ssid = "";
+    String pass = "";
+    if (httpServer.hasArg("ssid")) ssid = httpServer.arg("ssid");
+    if (httpServer.hasArg("password")) pass = httpServer.arg("password");
+    if (httpServer.hasArg("pass")) pass = httpServer.arg("pass");
+    ssid.trim();
+
+    if (ssid.length() == 0) {
+        httpServer.send(400, "application/json", "{\"error\":\"SSID cannot be empty\"}");
+        return;
+    }
+
+    saveWiFiPreferences(ssid, pass);
+    wifiConnectPending = true;
+    httpServer.send(200, "application/json", "{\"status\":\"Connecting\",\"ssid\":\"" + sanitizeJSONString(ssid) + "\"}");
+}
+
+void handleForgetWiFi() {
+    httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+    forgetWiFiPreferences();
+    WiFi.disconnect(true);
+    if (!isAPMode) {
+        startAPMode();
+    }
+    httpServer.send(200, "application/json", "{\"status\":\"WiFi forgotten, Soft AP active\",\"ap_ssid\":\"" + sanitizeJSONString(apSSID) + "\"}");
+}
+
+void handleCaptivePortal() {
+    if (isAPMode && WiFi.status() != WL_CONNECTED) {
+        httpServer.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
+        httpServer.send(302, "text/plain", "");
+    } else {
+        httpServer.send(200, "text/html", getDashboardHTML());
+    }
+}
+
 // ================= HTTP Content Generators =================
 String getDashboardHTML() {
     String localIP = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "Connecting...";
@@ -863,7 +1053,8 @@ String getDashboardHTML() {
     html += "<button id='btnTabConsole' class='btn btn-primary' onclick='switchTab(\"console\")'>📡 Mesh Console</button>";
     html += "<button id='btnTabConfig' class='btn' onclick='switchTab(\"config\")'>⚙️ Bluetooth & Config</button>";
     html += "</div></div>";
-    html += "<div style='display:flex; gap:8px;'>";
+    html += "<div style='display:flex; gap:8px; flex-wrap:wrap;'>";
+    html += "<span id='wifiHeaderBadge' class='badge bg-yellow' style='cursor:pointer;' onclick='switchTab(\"config\")'>WiFi: Checking...</span>";
     html += "<span id='bleBadge' class='badge bg-yellow' style='cursor:pointer;' onclick='switchTab(\"config\")'>BLE: Connecting...</span>";
     html += "<span id='wsBadge' class='badge bg-yellow'>WS: Connecting...</span>";
     html += "</div></div>";
@@ -891,12 +1082,13 @@ String getDashboardHTML() {
     // Card 2: Bridge & Network Status
     html += "<div class='card'>";
     html += "<div class='card-title'>Bridge Endpoints</div>";
-    html += "<div class='row'><span class='label'>WiFi Network</span><span class='val'>" + String(WIFI_SSID) + "</span></div>";
-    html += "<div class='row'><span class='label'>Bridge IP</span><span class='val'>" + localIP + "</span></div>";
-    html += "<div class='row'><span class='label'>Native TCP Port</span><span class='val'>" + localIP + ":5000</span></div>";
-    html += "<div class='row'><span class='label'>WebSocket Port</span><span class='val'>ws://" + localIP + ":5001</span></div>";
-    html += "<div class='row'><span class='label'>BLE Device</span><span class='val'>" + (bleConnectedDeviceName.length() > 0 ? bleConnectedDeviceName : "-") + " (" + String(bleLastRSSI) + " dBm)</span></div>";
-    html += "<div class='row'><span class='label'>BLE Packets (RX / TX)</span><span class='val'>" + String(blePacketsRx) + " / " + String(blePacketsTx) + "</span></div>";
+    html += "<div class='row'><span class='label'>Network Mode</span><span class='val' id='valNetMode'>-</span></div>";
+    html += "<div class='row'><span class='label'>WiFi / AP SSID</span><span class='val' id='valWiFiSSID'>-</span></div>";
+    html += "<div class='row'><span class='label'>Bridge IP</span><span class='val' id='valBridgeIP'>" + localIP + "</span></div>";
+    html += "<div class='row'><span class='label'>Native TCP Port</span><span class='val' id='valTcpPort'>" + localIP + ":5000</span></div>";
+    html += "<div class='row'><span class='label'>WebSocket Port</span><span class='val' id='valWsPort'>ws://" + localIP + ":5001</span></div>";
+    html += "<div class='row'><span class='label'>BLE Device</span><span class='val' id='valBleDev'>" + (bleConnectedDeviceName.length() > 0 ? bleConnectedDeviceName : "-") + " (" + String(bleLastRSSI) + " dBm)</span></div>";
+    html += "<div class='row'><span class='label'>BLE Packets (RX / TX)</span><span class='val' id='valBlePackets'>" + String(blePacketsRx) + " / " + String(blePacketsTx) + "</span></div>";
     html += "<div class='btn-group' style='margin-top:12px;'>";
     html += "<button class='btn' onclick='cmdPollMessages()'>📩 Check Messages</button>";
     html += "<button class='btn' onclick='location.reload()'>🔄 Refresh Page</button>";
@@ -936,6 +1128,41 @@ String getDashboardHTML() {
 
     // Tab 2: Bluetooth Device Scanner & Configuration
     html += "<div id='tabConfig' style='display:none; flex-direction:column; gap:16px;'>";
+
+    // Card: Wi-Fi Setup & Captive Portal
+    html += "<div class='card' id='wifiSetupCard' style='border: 1px solid #1f6feb;'>";
+    html += "<div style='display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;'>";
+    html += "<div class='card-title' style='margin-bottom:0; color:#58a6ff;'>📶 Wi-Fi Network Configuration & Soft AP</div>";
+    html += "<span id='wifiModeBadge' class='badge bg-yellow'>Detecting...</span>";
+    html += "</div>";
+    html += "<div id='wifiStatusDesc' style='font-size:13px; color:#c9d1d9; margin-bottom:12px;'>";
+    html += "Select your local Wi-Fi network below or enter credentials manually to connect the bridge.";
+    html += "</div>";
+    html += "<div class='grid' style='grid-template-columns: 1fr 1fr; gap:12px;'>";
+    html += "<div>";
+    html += "<div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;'>";
+    html += "<label class='label'>Select Wi-Fi Network</label>";
+    html += "<button class='btn' style='padding:2px 8px; font-size:11px;' onclick='scanWiFi()'>🔄 Scan Wi-Fi</button>";
+    html += "</div>";
+    html += "<select id='wifiSelect' style='margin-bottom:6px;' onchange='onSelectWiFiNetwork()'>";
+    html += "<option value=''>-- Click 'Scan Wi-Fi' to discover networks --</option>";
+    html += "</select>";
+    html += "<input type='text' id='wifiManualSsid' placeholder='Or enter SSID manually...' />";
+    html += "</div>";
+    html += "<div>";
+    html += "<label class='label' style='display:block; margin-bottom:4px;'>Wi-Fi Password</label>";
+    html += "<div style='display:flex; gap:6px;'>";
+    html += "<input type='password' id='wifiPass' placeholder='Enter Wi-Fi password (blank if open)' />";
+    html += "<button class='btn' type='button' style='padding:4px 10px; font-size:12px;' onclick='togglePassVisibility()'>👁️</button>";
+    html += "</div>";
+    html += "</div></div>";
+    html += "<div style='margin-top:12px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;'>";
+    html += "<div id='wifiFeedback' style='font-size:13px; font-family:monospace; min-height:20px;'></div>";
+    html += "<div class='btn-group'>";
+    html += "<button class='btn btn-primary' id='btnSaveWifi' onclick='saveWiFi()'>💾 Save & Connect</button>";
+    html += "<button class='btn btn-red' id='btnForgetWifi' onclick='forgetWiFi()'>🗑️ Forget Wi-Fi & Start Soft AP</button>";
+    html += "</div></div>";
+    html += "</div>"; // End Card Wi-Fi
 
     // Card: Active Connection Status
     html += "<div class='card'>";
@@ -1022,6 +1249,87 @@ String getDashboardHTML() {
     html += "let configPollInterval = null;";
     html += "const logBox = document.getElementById('logBox');";
     html += "const chatBox = document.getElementById('chatBox');";
+
+    html += "function scanWiFi() {";
+    html += "  const sel = document.getElementById('wifiSelect');";
+    html += "  sel.innerHTML = '<option value=\"\">⏳ Scanning nearby Wi-Fi networks...</option>';";
+    html += "  function pollScan() {";
+    html += "    fetch('/api/wifi/scan').then(r => r.json()).then(d => {";
+    html += "      if (d.scanning) {";
+    html += "        setTimeout(pollScan, 800);";
+    html += "        return;";
+    html += "      }";
+    html += "      let opts = '<option value=\"\">-- Select a Wi-Fi Network (' + (d.networks ? d.networks.length : 0) + ' found) --</option>';";
+    html += "      if (d.networks && d.networks.length > 0) {";
+    html += "        d.networks.sort((a,b) => b.rssi - a.rssi);";
+    html += "        const seen = new Set();";
+    html += "        d.networks.forEach(n => {";
+    html += "          if (!n.ssid || seen.has(n.ssid)) return;";
+    html += "          seen.add(n.ssid);";
+    html += "          const lock = n.secure ? '🔒' : '🔓';";
+    html += "          const signal = n.rssi > -65 ? '📶 Strong' : (n.rssi > -80 ? '📶 Medium' : '📶 Weak');";
+    html += "          opts += `<option value=\"${encodeURIComponent(n.ssid)}\">${lock} ${n.ssid} (${n.rssi} dBm, ${signal})</option>`;";
+    html += "        });";
+    html += "      } else {";
+    html += "        opts += '<option value=\"\">No networks found. Try scanning again.</option>';";
+    html += "      }";
+    html += "      sel.innerHTML = opts;";
+    html += "    }).catch(e => {";
+    html += "      sel.innerHTML = `<option value=\"\">Scan failed: ${e}</option>`;";
+    html += "    });";
+    html += "  }";
+    html += "  pollScan();";
+    html += "}";
+
+    html += "function onSelectWiFiNetwork() {";
+    html += "  const sel = document.getElementById('wifiSelect');";
+    html += "  if (sel.value) {";
+    html += "    document.getElementById('wifiManualSsid').value = decodeURIComponent(sel.value);";
+    html += "  }";
+    html += "}";
+
+    html += "function togglePassVisibility() {";
+    html += "  const p = document.getElementById('wifiPass');";
+    html += "  p.type = p.type === 'password' ? 'text' : 'password';";
+    html += "}";
+
+    html += "function saveWiFi() {";
+    html += "  const ssid = document.getElementById('wifiManualSsid').value.trim();";
+    html += "  const pass = document.getElementById('wifiPass').value;";
+    html += "  if (!ssid) { alert('Please select or enter a Wi-Fi SSID.'); return; }";
+    html += "  const fb = document.getElementById('wifiFeedback');";
+    html += "  fb.innerHTML = `<span style=\"color:#d29922;\">Connecting to \"${ssid}\"... Please wait.</span>`;";
+    html += "  const btn = document.getElementById('btnSaveWifi');";
+    html += "  btn.disabled = true;";
+    html += "  btn.textContent = '⏳ Connecting...';";
+    html += "  const params = new URLSearchParams();";
+    html += "  params.append('ssid', ssid);";
+    html += "  params.append('password', pass);";
+    html += "  fetch('/api/wifi/save', { method: 'POST', body: params }).then(r => r.json()).then(d => {";
+    html += "    fb.innerHTML = `<span style=\"color:#3fb950;\">Credentials saved! Connecting to ${ssid}...</span>`;";
+    html += "    setTimeout(() => {";
+    html += "      btn.disabled = false;";
+    html += "      btn.textContent = '💾 Save & Connect';";
+    html += "      checkStatus();";
+    html += "    }, 4000);";
+    html += "  }).catch(e => {";
+    html += "    fb.innerHTML = `<span style=\"color:#da3633;\">Connection error: ${e}</span>`;";
+    html += "    btn.disabled = false;";
+    html += "    btn.textContent = '💾 Save & Connect';";
+    html += "  });";
+    html += "}";
+
+    html += "function forgetWiFi() {";
+    html += "  if (!confirm('Forget saved Wi-Fi credentials and switch back to Soft AP mode?')) return;";
+    html += "  const fb = document.getElementById('wifiFeedback');";
+    html += "  fb.innerHTML = '<span style=\"color:#d29922;\">Forgetting Wi-Fi network...</span>';";
+    html += "  fetch('/api/wifi/forget', { method: 'POST' }).then(r => r.json()).then(d => {";
+    html += "    fb.innerHTML = '<span style=\"color:#3fb950;\">Wi-Fi credentials erased. Soft AP mode active.</span>';";
+    html += "    document.getElementById('wifiManualSsid').value = '';";
+    html += "    document.getElementById('wifiPass').value = '';";
+    html += "    setTimeout(checkStatus, 1500);";
+    html += "  });";
+    html += "}";
 
     html += "function switchTab(tab) {";
     html += "  document.getElementById('tabConsole').style.display = tab === 'console' ? 'flex' : 'none';";
@@ -1382,6 +1690,40 @@ String getDashboardHTML() {
     html += "    const aAddr = document.getElementById('activeDevAddr');";
     html += "    const aRssi = document.getElementById('activeDevRSSI');";
     html += "    const btnDisc = document.getElementById('btnDisconnect');";
+    html += "    const wBadge = document.getElementById('wifiHeaderBadge');";
+    html += "    const wModeBadge = document.getElementById('wifiModeBadge');";
+    html += "    const wDesc = document.getElementById('wifiStatusDesc');";
+    html += "    const btnForget = document.getElementById('btnForgetWifi');";
+    html += "    const valNetMode = document.getElementById('valNetMode');";
+    html += "    const valWiFiSSID = document.getElementById('valWiFiSSID');";
+    html += "    const valBridgeIP = document.getElementById('valBridgeIP');";
+    html += "    const valTcpPort = document.getElementById('valTcpPort');";
+    html += "    const valWsPort = document.getElementById('valWsPort');";
+    html += "    const valBleDev = document.getElementById('valBleDev');";
+    html += "    const valBlePackets = document.getElementById('valBlePackets');";
+    html += "    if (valNetMode) valNetMode.textContent = d.is_ap_mode ? 'Soft AP Mode' : 'Station Mode';";
+    html += "    if (valWiFiSSID) valWiFiSSID.textContent = d.is_ap_mode ? d.ap_ssid : (d.wifi_ssid + (d.wifi_rssi ? ` (${d.wifi_rssi} dBm)` : ''));";
+    html += "    if (valBridgeIP) valBridgeIP.textContent = d.ip_address || '-';";
+    html += "    if (valTcpPort) valTcpPort.textContent = `${d.ip_address}:${d.tcp_port}`;";
+    html += "    if (valWsPort) valWsPort.textContent = `ws://${d.ip_address}:${d.ws_port}`;";
+    html += "    if (valBleDev) valBleDev.textContent = `${d.ble_device_name || '-'} (${d.ble_rssi || 0} dBm)`;";
+    html += "    if (valBlePackets) valBlePackets.textContent = `${d.ble_rx} / ${d.ble_tx}`;";
+    html += "    if (d.is_ap_mode) {";
+    html += "      if (wBadge) { wBadge.className = 'badge bg-yellow'; wBadge.textContent = 'AP: ' + (d.ap_ssid || 'Setup'); }";
+    html += "      if (wModeBadge) { wModeBadge.className = 'badge bg-yellow'; wModeBadge.textContent = 'Soft AP: ' + d.ap_ssid; }";
+    html += "      if (wDesc) wDesc.innerHTML = `Bridge is in Soft AP mode (<b>${d.ap_ssid}</b> at <b>192.168.4.1</b>). Connect to your home Wi-Fi network below.`;";
+    html += "      if (btnForget) btnForget.style.display = 'none';";
+    html += "    } else if (d.wifi_connected) {";
+    html += "      if (wBadge) { wBadge.className = 'badge bg-green'; wBadge.textContent = 'WiFi: ' + d.wifi_ssid; }";
+    html += "      if (wModeBadge) { wModeBadge.className = 'badge bg-green'; wModeBadge.textContent = 'Connected: ' + d.wifi_ssid; }";
+    html += "      if (wDesc) wDesc.innerHTML = `Connected to <b>${d.wifi_ssid}</b> (IP: <b>${d.ip_address}</b> | RSSI: <b>${d.wifi_rssi} dBm</b>).`;";
+    html += "      if (btnForget) btnForget.style.display = 'inline-flex';";
+    html += "    } else {";
+    html += "      if (wBadge) { wBadge.className = 'badge bg-red'; wBadge.textContent = 'WiFi: Disconnected'; }";
+    html += "      if (wModeBadge) { wModeBadge.className = 'badge bg-red'; wModeBadge.textContent = 'Connecting...'; }";
+    html += "      if (wDesc) wDesc.innerHTML = 'Connecting to Wi-Fi...';";
+    html += "      if (btnForget) btnForget.style.display = 'inline-flex';";
+    html += "    }";
     html += "    if (d.ble_connected) {";
     html += "      b.className = 'badge bg-green';";
     html += "      b.textContent = `BLE: ${d.ble_device_name} (${d.ble_rssi} dBm)`;";
@@ -1433,27 +1775,15 @@ void setup() {
     // 1. Load preferences from NVS
     loadPreferences();
 
-    // 2. Connect to WiFi Network (Station mode)
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false); // Disable power save mode for instant packet processing
-    WiFi.setAutoReconnect(true);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.printf("[WiFi] Connecting to '%s'...\n", WIFI_SSID);
-
-    unsigned long startAttemptTime = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
-        delay(300);
-        Serial.print(".");
+    // 2. Connect to saved WiFi Network, or start Soft AP Captive Portal if unable to connect
+    bool wifiOk = false;
+    if (wifiSSID.length() > 0) {
+        wifiOk = connectWiFi(wifiSSID, wifiPass, 12);
     }
-    Serial.println();
 
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("[WiFi] Connected! IP: %s | Gateway: %s | RSSI: %d dBm\n",
-                      WiFi.localIP().toString().c_str(),
-                      WiFi.gatewayIP().toString().c_str(),
-                      WiFi.RSSI());
-    } else {
-        Serial.println("[WiFi] Connection in progress in background...");
+    if (!wifiOk) {
+        Serial.println("[WiFi] No valid saved Wi-Fi connection. Launching Soft AP setup portal...");
+        startAPMode();
     }
 
     // 3. Start mDNS
@@ -1483,10 +1813,25 @@ void setup() {
     httpServer.on("/api/bonds/clear", handleClearBonds);
     httpServer.on("/api/bonds/delete", handleDeleteBond);
     httpServer.on("/api/cache/clear-devices", handleClearDiscoveredCache);
+    httpServer.on("/api/wifi/scan", handleGetWiFiScan);
+    httpServer.on("/api/wifi/save", handleSaveWiFi);
+    httpServer.on("/api/wifi/forget", handleForgetWiFi);
     httpServer.on("/api/scan", handleStartScan);
     httpServer.on("/api/connect", handleConnect);
     httpServer.on("/api/disconnect", handleDisconnect);
     httpServer.on("/api/forget", handleForget);
+
+    // Captive portal probe redirects
+    httpServer.on("/hotspot-detect.html", handleCaptivePortal);
+    httpServer.on("/canonical.html", handleCaptivePortal);
+    httpServer.on("/generate_204", handleCaptivePortal);
+    httpServer.on("/gen_204", handleCaptivePortal);
+    httpServer.on("/ncsi.txt", handleCaptivePortal);
+    httpServer.on("/connecttest.txt", handleCaptivePortal);
+    httpServer.on("/redirect", handleCaptivePortal);
+    httpServer.on("/success.txt", handleCaptivePortal);
+    httpServer.onNotFound(handleCaptivePortal);
+
     httpServer.enableCORS(true);
     httpServer.begin();
     Serial.printf("[HTTP] Web dashboard & config ready on port %d\n", HTTP_PORT);
@@ -1518,8 +1863,23 @@ static unsigned long lastStatusPrint = 0;
 static unsigned long lastWiFiCheck = 0;
 
 void loop() {
+    // 0. Handle Captive Portal DNS requests
+    if (isAPMode) {
+        dnsServer.processNextRequest();
+    }
+
     // 1. Handle HTTP web requests (port 80)
     httpServer.handleClient();
+
+    // 1b. Handle pending Wi-Fi connection from Web UI
+    if (wifiConnectPending) {
+        wifiConnectPending = false;
+        Serial.printf("[WiFi] Initiating connection to '%s'...\n", wifiSSID.c_str());
+        bool ok = connectWiFi(wifiSSID, wifiPass, 12);
+        if (ok && isAPMode) {
+            stopAPMode();
+        }
+    }
 
     // 2. Handle WebSockets (port 5001)
     wsServer.loop();
@@ -1540,8 +1900,8 @@ void loop() {
         handleTCPClientData();
     }
 
-    // 4. Handle WiFi reconnection
-    if (millis() - lastWiFiCheck > 10000) {
+    // 4. Handle WiFi reconnection in Station mode
+    if (!isAPMode && wifiSSID.length() > 0 && millis() - lastWiFiCheck > 15000) {
         lastWiFiCheck = millis();
         if (WiFi.status() != WL_CONNECTED) {
             Serial.println("[WiFi] Reconnecting...");
@@ -1577,9 +1937,9 @@ void loop() {
     // 6. Periodic status print
     if (millis() - lastStatusPrint > 10000) {
         lastStatusPrint = millis();
-        Serial.printf("[STATUS] WiFi: %s (%s) | BLE: %s (%s, RSSI: %d) | Target: %s | TCP: %s | WS Clients: %u | Free Heap: %u\n",
-                      WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "DISCONNECTED",
-                      WIFI_SSID,
+        String netStr = WiFi.status() == WL_CONNECTED ? ("STA: " + WiFi.SSID() + " (" + WiFi.localIP().toString() + ")") : (isAPMode ? ("AP: " + apSSID + " (192.168.4.1)") : "DISCONNECTED");
+        Serial.printf("[STATUS] %s | BLE: %s (%s, RSSI: %d) | Target: %s | TCP: %s | WS Clients: %u | Free Heap: %u\n",
+                      netStr.c_str(),
                       bleConnected ? "CONNECTED" : (bleConnecting ? "CONNECTING" : "DISCONNECTED"),
                       bleConnectedDeviceName.c_str(),
                       bleLastRSSI,
