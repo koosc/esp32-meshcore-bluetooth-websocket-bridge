@@ -1,0 +1,6 @@
+.pio
+.cache
+.dummy
+.vscode
+meshcore-fw/
+compile_commands.json
