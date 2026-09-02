@@ -12,9 +12,11 @@
 #include <BLEClient.h>
 #include <BLE2902.h>
 #include <BLESecurity.h>
+#include <Preferences.h>
+#include <vector>
 
 // ================= Configuration =================
-#define BRIDGE_VERSION            "1.3.0"
+#define BRIDGE_VERSION            "1.4.0"
 #define DEFAULT_BLE_PIN           808978
 #define MESHCORE_SERVICE_UUID     "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 #define MESHCORE_RX_CHAR_UUID     "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
@@ -30,7 +32,25 @@
 #define USB_SERIAL_TX_FRAME_START 0x3c // '<'
 #define USB_SERIAL_RX_FRAME_START 0x3e // '>'
 
+// Discovered BLE device structure
+struct DiscoveredDevice {
+    String address;
+    String name;
+    int rssi;
+    bool isMeshCandidate;
+    bool hasServiceUUID;
+    unsigned long lastSeen;
+};
+
 // ================= State Variables =================
+static std::vector<DiscoveredDevice> discoveredDevices;
+static Preferences preferences;
+
+static String configuredTargetMac = "";
+static uint32_t configuredPinCode = DEFAULT_BLE_PIN;
+static bool autoConnectEnabled = true;
+static bool bleScanning = false;
+
 static BLEAddress* pTargetAddress = nullptr;
 static BLEClient* pClient = nullptr;
 static BLERemoteCharacteristic* pRxCharacteristic = nullptr;
@@ -66,12 +86,16 @@ static uint32_t wsPacketsRx = 0;
 static uint32_t wsPacketsTx = 0;
 
 // Forward declarations
-void startBLEScan();
+void startBLEScan(int durationSec = 5, bool clearList = false);
 bool connectToMeshCoreDevice();
 void sendFrameToMeshCore(const uint8_t* data, size_t len);
 void broadcastFrameToClients(const uint8_t* data, size_t len);
 String getDashboardHTML();
 String getStatusJSON();
+String getDevicesJSON();
+void savePreferences();
+void loadPreferences();
+void forgetPreferences();
 
 // ================= BLE Security Callbacks =================
 class BridgeSecurityCallbacks : public BLESecurityCallbacks {
@@ -131,49 +155,128 @@ class BridgeClientCallbacks : public BLEClientCallbacks {
 };
 
 // ================= BLE Advertised Device Callbacks =================
+static void onScanComplete(BLEScanResults scanResults) {
+    bleScanning = false;
+    Serial.printf("[SCAN] Scan complete. Total discovered devices: %d\n", (int)discoveredDevices.size());
+}
+
 class BridgeAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice advertisedDevice) override {
-        String name = advertisedDevice.getName().c_str();
         String addr = advertisedDevice.getAddress().toString().c_str();
+        String name = advertisedDevice.getName().c_str();
         int rssi = advertisedDevice.getRSSI();
 
-        bool matchUUID = advertisedDevice.isAdvertisingService(BLEUUID(MESHCORE_SERVICE_UUID));
+        bool hasUUID = advertisedDevice.isAdvertisingService(BLEUUID(MESHCORE_SERVICE_UUID));
         bool matchName = name.startsWith("MeshCore") ||
-                         name.startsWith("Whisper") ||
-                         name.startsWith("WisCore") ||
-                         name.startsWith("HT-") ||
-                         name.startsWith("Seeed") ||
-                         name.startsWith("Lilygo") ||
+                         name.startsWith("Whisper")  ||
+                         name.startsWith("WisCore")  ||
+                         name.startsWith("HT-")      ||
+                         name.startsWith("Seeed")    ||
+                         name.startsWith("Lilygo")   ||
                          name.startsWith("LowMesh");
+        bool isCandidate = hasUUID || matchName;
 
-        if (matchUUID || matchName) {
-            Serial.printf("[SCAN] Found MeshCore candidate: '%s' (%s, RSSI: %d dBm)\n",
-                          name.c_str(), addr.c_str(), rssi);
-            BLEDevice::getScan()->stop();
+        bool found = false;
+        for (auto& dev : discoveredDevices) {
+            if (dev.address.equalsIgnoreCase(addr)) {
+                found = true;
+                if (name.length() > 0 && dev.name.length() == 0) {
+                    dev.name = name;
+                }
+                dev.rssi = rssi;
+                dev.isMeshCandidate = dev.isMeshCandidate || isCandidate;
+                dev.hasServiceUUID = dev.hasServiceUUID || hasUUID;
+                dev.lastSeen = millis();
+                break;
+            }
+        }
+        if (!found && discoveredDevices.size() < 60) {
+            DiscoveredDevice d;
+            d.address = addr;
+            d.name = name;
+            d.rssi = rssi;
+            d.isMeshCandidate = isCandidate;
+            d.hasServiceUUID = hasUUID;
+            d.lastSeen = millis();
+            discoveredDevices.push_back(d);
+        }
 
-            if (pTargetAddress) delete pTargetAddress;
-            pTargetAddress = new BLEAddress(advertisedDevice.getAddress());
-            bleConnectedDeviceName = name.length() > 0 ? name : "MeshCore Device";
-            bleConnectedAddress = addr;
-            bleLastRSSI = rssi;
-            bleConnecting = true;
+        // Auto-connect to configured target MAC if set and enabled
+        if (!bleConnected && !bleConnecting && autoConnectEnabled && configuredTargetMac.length() > 0) {
+            if (addr.equalsIgnoreCase(configuredTargetMac)) {
+                Serial.printf("[SCAN] Found configured target '%s' (%s, RSSI: %d dBm)\n",
+                              name.c_str(), addr.c_str(), rssi);
+                BLEDevice::getScan()->stop();
+                bleScanning = false;
+                if (pTargetAddress) delete pTargetAddress;
+                pTargetAddress = new BLEAddress(advertisedDevice.getAddress());
+                bleConnectedDeviceName = name.length() > 0 ? name : "MeshCore Device";
+                bleConnectedAddress = addr;
+                bleLastRSSI = rssi;
+                bleConnecting = true;
+            }
         }
     }
 };
 
-void startBLEScan() {
-    if (bleConnected || bleConnecting) return;
-    Serial.println("[BLE] Starting scan for MeshCore devices...");
+void startBLEScan(int durationSec, bool clearList) {
+    if (bleScanning) return;
+    if (clearList) {
+        discoveredDevices.clear();
+    }
+    Serial.printf("[BLE] Starting background scan for %d seconds...\n", durationSec);
     BLEScan* pScan = BLEDevice::getScan();
     pScan->clearResults();
-    pScan->start(5, false);
+    bleScanning = true;
+    pScan->start(durationSec, onScanComplete, false);
+}
+
+// ================= Preferences (NVS) Storage =================
+void loadPreferences() {
+    preferences.begin("mesh_bridge", false);
+    configuredTargetMac = preferences.getString("target_mac", "");
+    configuredPinCode = preferences.getUInt("pin_code", DEFAULT_BLE_PIN);
+    autoConnectEnabled = preferences.getBool("auto_conn", true);
+    preferences.end();
+
+    blePinCode = configuredPinCode;
+    Serial.printf("[PREFS] Loaded Target MAC: '%s' | PIN: %u | AutoConnect: %d\n",
+                  configuredTargetMac.c_str(), configuredPinCode, autoConnectEnabled);
+}
+
+void savePreferences() {
+    preferences.begin("mesh_bridge", false);
+    preferences.putString("target_mac", configuredTargetMac);
+    preferences.putUInt("pin_code", configuredPinCode);
+    preferences.putBool("auto_conn", autoConnectEnabled);
+    preferences.end();
+    Serial.printf("[PREFS] Saved Target MAC: '%s' | PIN: %u | AutoConnect: %d\n",
+                  configuredTargetMac.c_str(), configuredPinCode, autoConnectEnabled);
+}
+
+void forgetPreferences() {
+    preferences.begin("mesh_bridge", false);
+    preferences.remove("target_mac");
+    preferences.end();
+    configuredTargetMac = "";
+    Serial.println("[PREFS] Target device forgotten.");
 }
 
 bool connectToMeshCoreDevice() {
     if (!pTargetAddress) return false;
 
-    Serial.printf("[BLE] Connecting to %s (%s)...\n",
-                  bleConnectedDeviceName.c_str(), pTargetAddress->toString().c_str());
+    Serial.printf("[BLE] Connecting to %s (%s) with PIN %u...\n",
+                  bleConnectedDeviceName.c_str(), pTargetAddress->toString().c_str(), blePinCode);
+
+    BLESecurity::setPassKey(true, blePinCode);
+
+    if (pClient) {
+        if (pClient->isConnected()) {
+            pClient->disconnect();
+        }
+        delete pClient;
+        pClient = nullptr;
+    }
 
     pClient = BLEDevice::createClient();
     pClient->setClientCallbacks(new BridgeClientCallbacks());
@@ -294,6 +397,10 @@ void handleTCPClientData() {
                 String json = getStatusJSON();
                 String resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + String(json.length()) + "\r\nConnection: close\r\n\r\n" + json;
                 tcpClient.print(resp);
+            } else if (req.indexOf("GET /api/devices") >= 0) {
+                String json = getDevicesJSON();
+                String resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + String(json.length()) + "\r\nConnection: close\r\n\r\n" + json;
+                tcpClient.print(resp);
             } else {
                 String html = getDashboardHTML();
                 String resp = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: " + String(html.length()) + "\r\nConnection: close\r\n\r\n" + html;
@@ -377,19 +484,155 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
     }
 }
 
+// ================= JSON Responses =================
+String getStatusJSON() {
+    String json = "{";
+    json += "\"version\":\"" + String(BRIDGE_VERSION) + "\",";
+    json += "\"ble_connected\":" + String(bleConnected ? "true" : "false") + ",";
+    json += "\"ble_connecting\":" + String(bleConnecting ? "true" : "false") + ",";
+    json += "\"ble_device_name\":\"" + bleConnectedDeviceName + "\",";
+    json += "\"ble_mac\":\"" + bleConnectedAddress + "\",";
+    json += "\"ble_rssi\":" + String(bleLastRSSI) + ",";
+    json += "\"ble_pin\":" + String(blePinCode) + ",";
+    json += "\"ble_rx\":" + String(blePacketsRx) + ",";
+    json += "\"ble_tx\":" + String(blePacketsTx) + ",";
+    json += "\"target_mac\":\"" + configuredTargetMac + "\",";
+    json += "\"auto_conn\":" + String(autoConnectEnabled ? "true" : "false") + ",";
+    json += "\"wifi_connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+    json += "\"wifi_ssid\":\"" + String(WIFI_SSID) + "\",";
+    json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
+    json += "\"ip_address\":\"" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "") + "\",";
+    json += "\"tcp_port\":" + String(TCP_PORT) + ",";
+    json += "\"ws_port\":" + String(WS_PORT) + ",";
+    json += "\"free_heap\":" + String(ESP.getFreeHeap()) + ",";
+    json += "\"uptime_sec\":" + String(millis() / 1000);
+    json += "}";
+    return json;
+}
+
+String getDevicesJSON() {
+    String json = "{\"scanning\":" + String(bleScanning ? "true" : "false") + ",";
+    json += "\"target_mac\":\"" + configuredTargetMac + "\",";
+    json += "\"pin\":" + String(blePinCode) + ",";
+    json += "\"auto_conn\":" + String(autoConnectEnabled ? "true" : "false") + ",";
+    json += "\"connected\":" + String(bleConnected ? "true" : "false") + ",";
+    json += "\"connected_mac\":\"" + (bleConnected ? bleConnectedAddress : "") + "\",";
+    json += "\"connected_name\":\"" + (bleConnected ? bleConnectedDeviceName : "") + "\",";
+    json += "\"devices\":[";
+    for (size_t i = 0; i < discoveredDevices.size(); i++) {
+        if (i > 0) json += ",";
+        json += "{";
+        json += "\"address\":\"" + discoveredDevices[i].address + "\",";
+        json += "\"name\":\"" + discoveredDevices[i].name + "\",";
+        json += "\"rssi\":" + String(discoveredDevices[i].rssi) + ",";
+        json += "\"is_mesh\":" + String(discoveredDevices[i].isMeshCandidate ? "true" : "false") + ",";
+        json += "\"connected\":" + String(bleConnected && bleConnectedAddress.equalsIgnoreCase(discoveredDevices[i].address) ? "true" : "false");
+        json += "}";
+    }
+    json += "]}";
+    return json;
+}
+
+// ================= HTTP Web Server Handlers =================
+void handleRoot() {
+    httpServer.send(200, "text/html", getDashboardHTML());
+}
+
+void handleStatusJSON() {
+    httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+    httpServer.send(200, "application/json", getStatusJSON());
+}
+
+void handleGetDevices() {
+    httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+    httpServer.send(200, "application/json", getDevicesJSON());
+}
+
+void handleStartScan() {
+    httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+    startBLEScan(5, false);
+    httpServer.send(200, "application/json", "{\"status\":\"Scan started\"}");
+}
+
+void handleConnect() {
+    httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+    String address = "";
+    uint32_t pin = blePinCode;
+    bool save = true;
+    bool autoConn = true;
+
+    if (httpServer.hasArg("address")) address = httpServer.arg("address");
+    if (httpServer.hasArg("pin")) pin = (uint32_t)httpServer.arg("pin").toInt();
+    if (httpServer.hasArg("save")) save = (httpServer.arg("save") == "true" || httpServer.arg("save") == "1");
+    if (httpServer.hasArg("auto")) autoConn = (httpServer.arg("auto") == "true" || httpServer.arg("auto") == "1");
+
+    address.trim();
+    if (address.length() == 0) {
+        httpServer.send(400, "application/json", "{\"error\":\"Missing address parameter\"}");
+        return;
+    }
+
+    blePinCode = pin > 0 ? pin : DEFAULT_BLE_PIN;
+    BLESecurity::setPassKey(true, blePinCode);
+
+    if (save) {
+        configuredTargetMac = address;
+        configuredPinCode = blePinCode;
+        autoConnectEnabled = autoConn;
+        savePreferences();
+    }
+
+    if (bleConnected && pClient) {
+        pClient->disconnect();
+        bleConnected = false;
+    }
+
+    if (pTargetAddress) delete pTargetAddress;
+    pTargetAddress = new BLEAddress(address.c_str());
+    bleConnectedDeviceName = address;
+    for (const auto& dev : discoveredDevices) {
+        if (dev.address.equalsIgnoreCase(address) && dev.name.length() > 0) {
+            bleConnectedDeviceName = dev.name;
+            break;
+        }
+    }
+    bleConnectedAddress = address;
+    bleConnecting = true;
+
+    httpServer.send(200, "application/json", "{\"status\":\"Connecting\",\"address\":\"" + address + "\",\"pin\":" + String(blePinCode) + "}");
+}
+
+void handleDisconnect() {
+    httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+    if (bleConnected && pClient) {
+        pClient->disconnect();
+        bleConnected = false;
+        bleConnecting = false;
+        pRxCharacteristic = nullptr;
+        pTxCharacteristic = nullptr;
+    }
+    httpServer.send(200, "application/json", "{\"status\":\"Disconnected\"}");
+}
+
+void handleForget() {
+    httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+    forgetPreferences();
+    httpServer.send(200, "application/json", "{\"status\":\"Target forgotten\"}");
+}
+
 // ================= HTTP Content Generators =================
 String getDashboardHTML() {
     String localIP = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "Connecting...";
     String html = "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>";
     html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-    html += "<title>ESP32 MeshCore Console</title>";
+    html += "<title>ESP32 MeshCore BLE Bridge</title>";
     html += "<style>";
     html += ":root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #c9d1d9; --accent: #58a6ff; --green: #238636; --green-txt: #3fb950; --red: #da3633; --yellow: #d29922; }";
     html += "* { box-sizing: border-box; }";
     html += "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 16px; }";
-    html += ".container { max-width: 900px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }";
-    html += ".header { display: flex; justify-content: space-between; align-items: center; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; }";
-    html += ".title { font-size: 20px; font-weight: bold; color: var(--accent); display: flex; align-items: center; gap: 8px; }";
+    html += ".container { max-width: 920px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }";
+    html += ".header { display: flex; justify-content: space-between; align-items: center; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; flex-wrap: wrap; gap: 10px; }";
+    html += ".title { font-size: 19px; font-weight: bold; color: var(--accent); display: flex; align-items: center; gap: 8px; }";
     html += ".badge { padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; display: inline-flex; align-items: center; gap: 4px; }";
     html += ".bg-green { background: rgba(35,134,54,0.2); color: var(--green-txt); border: 1px solid var(--green); }";
     html += ".bg-red { background: rgba(218,54,51,0.2); color: #f85149; border: 1px solid var(--red); }";
@@ -407,7 +650,9 @@ String getDashboardHTML() {
     html += ".btn-primary:hover { background: #2ea043; }";
     html += ".btn-blue { background: #1f6feb; border-color: rgba(240,246,252,0.1); color: #fff; }";
     html += ".btn-blue:hover { background: #388bfd; }";
-    html += ".btn-group { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }";
+    html += ".btn-red { background: rgba(218,54,51,0.2); border-color: var(--red); color: #f85149; }";
+    html += ".btn-red:hover { background: var(--red); color: #fff; }";
+    html += ".btn-group { display: flex; flex-wrap: wrap; gap: 8px; }";
     html += "input, select, textarea { background: #0d1117; border: 1px solid var(--border); color: #c9d1d9; padding: 8px 12px; border-radius: 6px; font-size: 14px; width: 100%; outline: none; }";
     html += "input:focus, select:focus, textarea:focus { border-color: var(--accent); }";
     html += ".chat-box { height: 260px; overflow-y: auto; background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }";
@@ -422,18 +667,27 @@ String getDashboardHTML() {
     html += ".log-rx { color: #3fb950; background: rgba(63,185,80,0.08); }";
     html += ".log-err { color: #f85149; background: rgba(248,81,73,0.08); }";
     html += ".log-info { color: #8b949e; }";
+    html += ".device-card { background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px; cursor: pointer; transition: all 0.2s; }";
+    html += ".device-card:hover { border-color: var(--accent); background: #161b22; }";
+    html += ".device-connected { border-color: var(--green) !important; background: rgba(35,134,54,0.08) !important; }";
     html += "</style></head><body>";
     html += "<div class='container'>";
 
-    // Header
+    // Header with Tab Switcher
     html += "<div class='header'>";
+    html += "<div style='display:flex; align-items:center; gap:16px; flex-wrap:wrap;'>";
     html += "<div class='title'>⚡ MeshCore BLE Bridge</div>";
+    html += "<div class='btn-group'>";
+    html += "<button id='btnTabConsole' class='btn btn-primary' onclick='switchTab(\"console\")'>📡 Mesh Console</button>";
+    html += "<button id='btnTabConfig' class='btn' onclick='switchTab(\"config\")'>⚙️ Bluetooth & Config</button>";
+    html += "</div></div>";
     html += "<div style='display:flex; gap:8px;'>";
-    html += "<span id='bleBadge' class='badge bg-yellow'>BLE: Scanning...</span>";
+    html += "<span id='bleBadge' class='badge bg-yellow' style='cursor:pointer;' onclick='switchTab(\"config\")'>BLE: Connecting...</span>";
     html += "<span id='wsBadge' class='badge bg-yellow'>WS: Connecting...</span>";
     html += "</div></div>";
 
-    // Main Grid
+    // Tab 1: Mesh Console & Radio Dashboard
+    html += "<div id='tabConsole' style='display:flex; flex-direction:column; gap:16px;'>";
     html += "<div class='grid'>";
 
     // Card 1: Node Info & Radio
@@ -483,8 +737,7 @@ String getDashboardHTML() {
     html += "</select>";
     html += "<input type='text' id='msgInput' placeholder='Type a message to send over LoRa mesh...' onkeypress='if(event.key===\"Enter\") sendMessage()' />";
     html += "<button class='btn btn-blue' onclick='sendMessage()'>Send 📤</button>";
-    html += "</div>";
-    html += "</div>";
+    html += "</div></div>";
 
     // Card 4: Packet Inspector & Raw Console
     html += "<div class='card'>";
@@ -497,13 +750,189 @@ String getDashboardHTML() {
     html += "<input type='text' id='hexInput' placeholder='Send raw Hex command (e.g. 01 04 00 00 00 00 00 00 42 72 69 64 67 65)' />";
     html += "<button class='btn' onclick='sendRawHex()'>Send Hex</button>";
     html += "</div></div>";
+    html += "</div>"; // End tabConsole
+
+    // Tab 2: Bluetooth Device Scanner & Configuration
+    html += "<div id='tabConfig' style='display:none; flex-direction:column; gap:16px;'>";
+
+    // Card: Active Connection Status
+    html += "<div class='card'>";
+    html += "<div class='card-title'>Active Bluetooth Connection</div>";
+    html += "<div id='activeConnBox' style='display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;'>";
+    html += "<div>";
+    html += "<div style='font-size:16px; font-weight:bold; color:#f0f6fc;' id='activeDevName'>No device connected</div>";
+    html += "<div style='font-family:monospace; font-size:13px; color:#8b949e;' id='activeDevAddr'>-</div>";
+    html += "</div>";
+    html += "<div style='display:flex; gap:8px; align-items:center;'>";
+    html += "<span id='activeDevRSSI' class='badge bg-yellow'>Disconnected</span>";
+    html += "<button id='btnDisconnect' class='btn btn-red' style='display:none;' onclick='disconnectTarget()'>🔌 Disconnect</button>";
+    html += "</div></div></div>";
+
+    // Card: Device Scanner
+    html += "<div class='card'>";
+    html += "<div style='display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;'>";
+    html += "<div class='card-title' style='margin-bottom:0;'>Discovered Bluetooth Devices</div>";
+    html += "<div style='display:flex; align-items:center; gap:12px; flex-wrap:wrap;'>";
+    html += "<label style='font-size:13px; color:#c9d1d9; display:flex; align-items:center; gap:6px; cursor:pointer;'>";
+    html += "<input type='checkbox' id='showAllCheck' style='width:auto; cursor:pointer;' onchange='renderDevices()' />";
+    html += "Show all Bluetooth devices (unfiltered)";
+    html += "</label>";
+    html += "<button id='scanBtn' class='btn btn-blue' onclick='startScan()'>🔍 Scan for Devices</button>";
+    html += "</div></div>";
+    html += "<div id='scanSummary' style='font-size:12px; color:#8b949e; margin-bottom:10px;'>Click 'Scan for Devices' to discover nearby BLE devices.</div>";
+    html += "<div id='deviceList' style='display:flex; flex-direction:column; gap:8px; max-height:360px; overflow-y:auto; padding-right:4px;'>";
+    html += "<div style='padding:20px; text-align:center; color:#8b949e;'>Click 'Scan for Devices' above to search for nearby Bluetooth devices.</div>";
+    html += "</div></div>";
+
+    // Card: Connection & PIN Configuration
+    html += "<div class='card'>";
+    html += "<div class='card-title'>Bluetooth Connection & PIN Configuration</div>";
+    html += "<div class='grid' style='grid-template-columns: 1fr 1fr; gap:12px;'>";
+    html += "<div>";
+    html += "<label class='label' style='display:block; margin-bottom:4px;'>Target Device MAC Address</label>";
+    html += "<input type='text' id='cfgTargetMac' placeholder='e.g. 24:4C:AB:12:34:56' />";
+    html += "</div>";
+    html += "<div>";
+    html += "<label class='label' style='display:block; margin-bottom:4px;'>BLE Pairing PIN / Passkey (Default: 808978)</label>";
+    html += "<input type='number' id='cfgPin' value='808978' placeholder='808978' />";
+    html += "</div></div>";
+    html += "<div style='margin-top:12px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;'>";
+    html += "<label style='font-size:13px; color:#c9d1d9; display:flex; align-items:center; gap:6px; cursor:pointer;'>";
+    html += "<input type='checkbox' id='cfgAuto' checked style='width:auto; cursor:pointer;' />";
+    html += "Automatically reconnect to this device on boot";
+    html += "</label>";
+    html += "<div class='btn-group'>";
+    html += "<button class='btn btn-primary' onclick='connectTarget()'>🔗 Connect to Device</button>";
+    html += "<button class='btn' onclick='forgetTarget()'>🗑️ Forget Target</button>";
+    html += "</div></div>";
+    html += "<div id='connFeedback' style='margin-top:10px; font-size:13px; font-family:monospace; min-height:20px;'></div>";
+    html += "</div>"; // End Card
+
+    html += "</div>"; // End tabConfig
 
     // Client-side JavaScript
     html += "<script>";
     html += "let ws = null;";
     html += "let myNodeName = 'BridgeWeb';";
+    html += "let devicesList = [];";
     html += "const logBox = document.getElementById('logBox');";
     html += "const chatBox = document.getElementById('chatBox');";
+
+    html += "function switchTab(tab) {";
+    html += "  document.getElementById('tabConsole').style.display = tab === 'console' ? 'flex' : 'none';";
+    html += "  document.getElementById('tabConfig').style.display = tab === 'config' ? 'flex' : 'none';";
+    html += "  document.getElementById('btnTabConsole').className = 'btn ' + (tab === 'console' ? 'btn-primary' : '');";
+    html += "  document.getElementById('btnTabConfig').className = 'btn ' + (tab === 'config' ? 'btn-primary' : '');";
+    html += "  if (tab === 'config') { fetchDevices(); }";
+    html += "}";
+
+    html += "function fetchDevices() {";
+    html += "  fetch('/api/devices').then(r => r.json()).then(d => {";
+    html += "    devicesList = d.devices || [];";
+    html += "    if (d.target_mac && !document.getElementById('cfgTargetMac').value) {";
+    html += "      document.getElementById('cfgTargetMac').value = d.target_mac;";
+    html += "    }";
+    html += "    if (d.pin) document.getElementById('cfgPin').value = d.pin;";
+    html += "    if (typeof d.auto_conn !== 'undefined') document.getElementById('cfgAuto').checked = d.auto_conn;";
+    html += "    renderDevices();";
+    html += "    const btn = document.getElementById('scanBtn');";
+    html += "    if (d.scanning) {";
+    html += "      btn.textContent = '⏳ Scanning...';";
+    html += "      btn.disabled = true;";
+    html += "    } else {";
+    html += "      btn.textContent = '🔍 Scan for Devices';";
+    html += "      btn.disabled = false;";
+    html += "    }";
+    html += "  }).catch(e => console.error(e));";
+    html += "}";
+
+    html += "function startScan() {";
+    html += "  const btn = document.getElementById('scanBtn');";
+    html += "  btn.textContent = '⏳ Scanning...';";
+    html += "  btn.disabled = true;";
+    html += "  fetch('/api/scan', { method: 'POST' }).then(() => {";
+    html += "    setTimeout(fetchDevices, 1200);";
+    html += "    setTimeout(fetchDevices, 3200);";
+    html += "    setTimeout(fetchDevices, 5500);";
+    html += "  });";
+    html += "}";
+
+    html += "function renderDevices() {";
+    html += "  const showAll = document.getElementById('showAllCheck').checked;";
+    html += "  const listEl = document.getElementById('deviceList');";
+    html += "  const filtered = devicesList.filter(d => showAll || d.is_mesh);";
+    html += "  const meshCount = devicesList.filter(d => d.is_mesh).length;";
+    html += "  document.getElementById('scanSummary').textContent = `Found ${devicesList.length} device(s) (${meshCount} MeshCore candidate(s))`;";
+    html += "  if (filtered.length === 0) {";
+    html += "    listEl.innerHTML = `<div style='padding:20px; text-align:center; color:#8b949e;'>${devicesList.length > 0 ? 'No MeshCore devices found. Check \"Show all Bluetooth devices\" to see all ' + devicesList.length + ' nearby devices.' : 'No devices found. Click \"Scan for Devices\" above.'}</div>`;";
+    html += "    return;";
+    html += "  }";
+    html += "  filtered.sort((a,b) => b.rssi - a.rssi);";
+    html += "  let html = '';";
+    html += "  filtered.forEach(d => {";
+    html += "    const isConn = d.connected;";
+    html += "    const name = d.name || 'Unnamed Device';";
+    html += "    const tag = d.is_mesh ? `<span class='badge bg-green'>MeshCore / NUS</span>` : `<span class='badge' style='background:#30363d; color:#8b949e;'>Generic BLE</span>`;";
+    html += "    const rssiColor = d.rssi > -70 ? '#3fb950' : (d.rssi > -85 ? '#d29922' : '#da3633');";
+    html += "    html += `<div class='device-card ${isConn ? \"device-connected\" : \"\"}' onclick='selectDevice(\"${d.address}\", \"${name}\")'>`;";
+    html += "    html += `<div style='display:flex; justify-content:space-between; align-items:center;'><div>`;";
+    html += "    html += `<div style='font-weight:600; font-size:14px; color:#f0f6fc; display:flex; align-items:center; gap:8px;'>${d.is_mesh ? '📻' : '📱'} ${name} ${tag} ${isConn ? '<span class=\"badge bg-green\">Active</span>' : ''}</div>`;";
+    html += "    html += `<div style='font-family:monospace; font-size:12px; color:#8b949e; margin-top:3px;'>${d.address}</div></div>`;";
+    html += "    html += `<div style='text-align:right;'><span style='font-family:monospace; font-weight:bold; color:${rssiColor}; font-size:13px;'>${d.rssi} dBm</span>`;";
+    html += "    html += `<div style='margin-top:4px;'><button class='btn ${isConn ? \"btn-blue\" : \"btn-primary\"}' style='padding:4px 10px; font-size:12px;' onclick='event.stopPropagation(); selectAndConnect(\"${d.address}\", \"${name}\")'>${isConn ? 'Connected' : 'Connect 🔗'}</button></div>`;";
+    html += "    html += `</div></div></div>`;";
+    html += "  });";
+    html += "  listEl.innerHTML = html;";
+    html += "}";
+
+    html += "function selectDevice(addr, name) {";
+    html += "  document.getElementById('cfgTargetMac').value = addr;";
+    html += "  document.getElementById('connFeedback').innerHTML = `<span style='color:#58a6ff;'>Selected: <b>${name || addr}</b> (${addr})</span>`;";
+    html += "}";
+
+    html += "function selectAndConnect(addr, name) {";
+    html += "  selectDevice(addr, name);";
+    html += "  connectTarget();";
+    html += "}";
+
+    html += "function connectTarget() {";
+    html += "  const addr = document.getElementById('cfgTargetMac').value.trim();";
+    html += "  const pin = document.getElementById('cfgPin').value.trim() || '808978';";
+    html += "  const autoConn = document.getElementById('cfgAuto').checked;";
+    html += "  if (!addr) { alert('Please enter or select a Bluetooth device MAC address.'); return; }";
+    html += "  const fb = document.getElementById('connFeedback');";
+    html += "  fb.innerHTML = `<span style='color:#d29922;'>Connecting to ${addr} with PIN ${pin}...</span>`;";
+    html += "  const params = new URLSearchParams();";
+    html += "  params.append('address', addr);";
+    html += "  params.append('pin', pin);";
+    html += "  params.append('save', 'true');";
+    html += "  params.append('auto', autoConn ? 'true' : 'false');";
+    html += "  fetch('/api/connect', { method: 'POST', body: params }).then(r => r.json()).then(d => {";
+    html += "    fb.innerHTML = `<span style='color:#3fb950;'>Connection initiated to ${addr}!</span>`;";
+    html += "    setTimeout(fetchDevices, 2000);";
+    html += "    setTimeout(checkStatus, 2000);";
+    html += "  }).catch(e => { fb.innerHTML = `<span style='color:#da3633;'>Connection error: ${e}</span>`; });";
+    html += "}";
+
+    html += "function disconnectTarget() {";
+    html += "  const fb = document.getElementById('connFeedback');";
+    html += "  fb.innerHTML = `<span style='color:#d29922;'>Disconnecting...</span>`;";
+    html += "  fetch('/api/disconnect', { method: 'POST' }).then(r => r.json()).then(() => {";
+    html += "    fb.innerHTML = `<span style='color:#8b949e;'>Disconnected.</span>`;";
+    html += "    fetchDevices();";
+    html += "    checkStatus();";
+    html += "  });";
+    html += "}";
+
+    html += "function forgetTarget() {";
+    html += "  if (!confirm('Forget configured target Bluetooth device?')) return;";
+    html += "  fetch('/api/forget', { method: 'POST' }).then(r => r.json()).then(() => {";
+    html += "    document.getElementById('cfgTargetMac').value = '';";
+    html += "    document.getElementById('connFeedback').innerHTML = `<span style='color:#8b949e;'>Target device forgotten.</span>`;";
+    html += "    fetchDevices();";
+    html += "    checkStatus();";
+    html += "  });";
+    html += "}";
 
     html += "function log(msg, type='info') {";
     html += "  const time = new Date().toLocaleTimeString();";
@@ -604,7 +1033,7 @@ String getDashboardHTML() {
     html += "  const code = p[0];";
     html += "  log(`RX [Code 0x${code.toString(16).padStart(2,'0')}]: ${hex}`, 'rx');";
 
-    html += "  if (code === 0x05) {"; // RESP_CODE_SELF_INFO
+    html += "  if (code === 0x05) {";
     html += "    const pubKeyHex = Array.from(p.slice(4, 36)).map(b => b.toString(16).padStart(2,'0')).join('');";
     html += "    document.getElementById('valPubKey').textContent = pubKeyHex;";
     html += "    if (p.length >= 60) {";
@@ -623,18 +1052,18 @@ String getDashboardHTML() {
     html += "    document.getElementById('valRadioParams').textContent = `BW ${bw}k / SF${sf} / CR 4/${cr}`;";
     html += "    document.getElementById('valTxPower').textContent = `${txPower} dBm`;";
     html += "    addChat('System', 'Received node profile info from MeshCore', 'sys');";
-    html += "  } else if (code === 0x06) {"; // RESP_CODE_MSG_SENT
+    html += "  } else if (code === 0x06) {";
     html += "    log('Message broadcast queued on mesh radio', 'info');";
-    html += "  } else if (code === 0x08 || code === 0x11) {"; // CHANNEL_MSG_RECV
+    html += "  } else if (code === 0x08 || code === 0x11) {";
     html += "    const chan = p[4] || 0;";
     html += "    const senderBytes = p.slice(5, 37);";
     html += "    const senderHex = Array.from(senderBytes.slice(0,4)).map(b => b.toString(16).padStart(2,'0')).join('');";
     html += "    const text = new TextDecoder().decode(p.slice(37));";
     html += "    addChat(`Node ${senderHex} (Ch ${chan})`, text, 'rx');";
-    html += "  } else if (code === 0x0c) {"; // BATTERY
+    html += "  } else if (code === 0x0c) {";
     html += "    const mv = p[1] | (p[2] << 8);";
     html += "    document.getElementById('valBattery').textContent = `${(mv/1000).toFixed(2)} V (${mv} mV)`;";
-    html += "  } else if (code === 0x0a) {"; // NO_MORE_MSGS
+    html += "  } else if (code === 0x0a) {";
     html += "    log('No more queued messages on node', 'info');";
     html += "  }";
     html += "}";
@@ -665,12 +1094,34 @@ String getDashboardHTML() {
     html += "function checkStatus() {";
     html += "  fetch('/status').then(r => r.json()).then(d => {";
     html += "    const b = document.getElementById('bleBadge');";
+    html += "    const aName = document.getElementById('activeDevName');";
+    html += "    const aAddr = document.getElementById('activeDevAddr');";
+    html += "    const aRssi = document.getElementById('activeDevRSSI');";
+    html += "    const btnDisc = document.getElementById('btnDisconnect');";
     html += "    if (d.ble_connected) {";
     html += "      b.className = 'badge bg-green';";
     html += "      b.textContent = `BLE: ${d.ble_device_name} (${d.ble_rssi} dBm)`;";
-    html += "    } else {";
+    html += "      aName.textContent = `Connected: ${d.ble_device_name}`;";
+    html += "      aAddr.textContent = `${d.ble_mac} (PIN: ${d.ble_pin})`;";
+    html += "      aRssi.className = 'badge bg-green';";
+    html += "      aRssi.textContent = `${d.ble_rssi} dBm`;";
+    html += "      btnDisc.style.display = 'inline-flex';";
+    html += "    } else if (d.ble_connecting) {";
     html += "      b.className = 'badge bg-yellow';";
     html += "      b.textContent = 'BLE: Connecting...';";
+    html += "      aName.textContent = 'Connecting to Bluetooth device...';";
+    html += "      aAddr.textContent = d.target_mac || 'Searching...';";
+    html += "      aRssi.className = 'badge bg-yellow';";
+    html += "      aRssi.textContent = 'Connecting';";
+    html += "      btnDisc.style.display = 'none';";
+    html += "    } else {";
+    html += "      b.className = 'badge bg-yellow';";
+    html += "      b.textContent = 'BLE: Disconnected';";
+    html += "      aName.textContent = 'No device connected';";
+    html += "      aAddr.textContent = d.target_mac ? `Target: ${d.target_mac}` : 'No target configured';";
+    html += "      aRssi.className = 'badge bg-red';";
+    html += "      aRssi.textContent = 'Disconnected';";
+    html += "      btnDisc.style.display = 'none';";
     html += "    }";
     html += "  }).catch(() => {});";
     html += "}";
@@ -678,42 +1129,13 @@ String getDashboardHTML() {
     html += "window.onload = () => {";
     html += "  connectWS();";
     html += "  checkStatus();";
-    html += "  setInterval(checkStatus, 5000);";
+    html += "  fetchDevices();";
+    html += "  setInterval(checkStatus, 4000);";
     html += "};";
     html += "</script>";
 
     html += "</div></body></html>";
     return html;
-}
-
-String getStatusJSON() {
-    String json = "{";
-    json += "\"version\":\"" + String(BRIDGE_VERSION) + "\",";
-    json += "\"ble_connected\":" + String(bleConnected ? "true" : "false") + ",";
-    json += "\"ble_device_name\":\"" + bleConnectedDeviceName + "\",";
-    json += "\"ble_mac\":\"" + bleConnectedAddress + "\",";
-    json += "\"ble_rssi\":" + String(bleLastRSSI) + ",";
-    json += "\"ble_rx\":" + String(blePacketsRx) + ",";
-    json += "\"ble_tx\":" + String(blePacketsTx) + ",";
-    json += "\"wifi_connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
-    json += "\"wifi_ssid\":\"" + String(WIFI_SSID) + "\",";
-    json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
-    json += "\"ip_address\":\"" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "") + "\",";
-    json += "\"tcp_port\":" + String(TCP_PORT) + ",";
-    json += "\"ws_port\":" + String(WS_PORT) + ",";
-    json += "\"free_heap\":" + String(ESP.getFreeHeap()) + ",";
-    json += "\"uptime_sec\":" + String(millis() / 1000);
-    json += "}";
-    return json;
-}
-
-void handleRoot() {
-    httpServer.send(200, "text/html", getDashboardHTML());
-}
-
-void handleStatusJSON() {
-    httpServer.sendHeader("Access-Control-Allow-Origin", "*");
-    httpServer.send(200, "application/json", getStatusJSON());
 }
 
 // ================= Setup & Loop =================
@@ -724,7 +1146,10 @@ void setup() {
     Serial.printf("  ESP32-C3 MeshCore BLE Bridge v%s\n", BRIDGE_VERSION);
     Serial.println("========================================");
 
-    // 1. Connect to WiFi Network (Station mode)
+    // 1. Load preferences from NVS
+    loadPreferences();
+
+    // 2. Connect to WiFi Network (Station mode)
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false); // Disable power save mode for instant packet processing
     WiFi.setAutoReconnect(true);
@@ -747,7 +1172,7 @@ void setup() {
         Serial.println("[WiFi] Connection in progress in background...");
     }
 
-    // 2. Start mDNS
+    // 3. Start mDNS
     if (MDNS.begin("meshcore-ble-bridge")) {
         Serial.println("[mDNS] Responder started: http://meshcore-ble-bridge.local");
         MDNS.addService("http", "tcp", HTTP_PORT);
@@ -755,24 +1180,30 @@ void setup() {
         MDNS.addService("meshcore-ws", "tcp", WS_PORT);
     }
 
-    // 3. Start TCP Server on port 5000
+    // 4. Start TCP Server on port 5000
     tcpServer.begin();
     tcpServer.setNoDelay(true);
     Serial.printf("[TCP] Server listening on port %d\n", TCP_PORT);
 
-    // 4. Start WebSocket Server on port 5001
+    // 5. Start WebSocket Server on port 5001
     wsServer.begin();
     wsServer.onEvent(onWebSocketEvent);
     Serial.printf("[WS] Server listening on port %d\n", WS_PORT);
 
-    // 5. Start HTTP Web Server on port 80
+    // 6. Start HTTP Web Server on port 80
     httpServer.on("/", handleRoot);
+    httpServer.on("/config", handleRoot);
     httpServer.on("/status", handleStatusJSON);
+    httpServer.on("/api/devices", handleGetDevices);
+    httpServer.on("/api/scan", handleStartScan);
+    httpServer.on("/api/connect", handleConnect);
+    httpServer.on("/api/disconnect", handleDisconnect);
+    httpServer.on("/api/forget", handleForget);
     httpServer.enableCORS(true);
     httpServer.begin();
-    Serial.printf("[HTTP] Web dashboard ready on port %d\n", HTTP_PORT);
+    Serial.printf("[HTTP] Web dashboard & config ready on port %d\n", HTTP_PORT);
 
-    // 6. Initialize BLE Device and Security
+    // 7. Initialize BLE Device and Security
     BLEDevice::init("ESP32C3-MeshBridge");
     BLEDevice::setSecurityCallbacks(new BridgeSecurityCallbacks());
 
@@ -789,8 +1220,8 @@ void setup() {
     pBLEScan->setInterval(100);
     pBLEScan->setWindow(99);
 
-    Serial.println("[BLE] Starting initial scan for MeshCore devices...");
-    startBLEScan();
+    Serial.println("[BLE] Starting initial discovery scan...");
+    startBLEScan(5, true);
 }
 
 static unsigned long lastScanAttempt = 0;
@@ -834,26 +1265,29 @@ void loop() {
         if (connectToMeshCoreDevice()) {
             Serial.println("[BLE] Connection established and ready to bridge!");
         } else {
-            Serial.println("[BLE] Connection attempt failed, will retry scan in 3 seconds...");
-            delay(3000);
-            startBLEScan();
+            Serial.println("[BLE] Connection attempt failed, will retry scan in 5 seconds...");
+            delay(1000);
+            bleConnecting = false;
         }
     } else if (!bleConnected) {
-        if (millis() - lastScanAttempt > 8000) {
-            lastScanAttempt = millis();
-            startBLEScan();
+        if (autoConnectEnabled && configuredTargetMac.length() > 0) {
+            if (millis() - lastScanAttempt > 10000 && !bleScanning) {
+                lastScanAttempt = millis();
+                startBLEScan(5, false);
+            }
         }
     }
 
     // 6. Periodic status print
     if (millis() - lastStatusPrint > 10000) {
         lastStatusPrint = millis();
-        Serial.printf("[STATUS] WiFi: %s (%s) | BLE: %s (%s, RSSI: %d) | TCP: %s | WS Clients: %u | Free Heap: %u\n",
+        Serial.printf("[STATUS] WiFi: %s (%s) | BLE: %s (%s, RSSI: %d) | Target: %s | TCP: %s | WS Clients: %u | Free Heap: %u\n",
                       WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "DISCONNECTED",
                       WIFI_SSID,
                       bleConnected ? "CONNECTED" : (bleConnecting ? "CONNECTING" : "DISCONNECTED"),
                       bleConnectedDeviceName.c_str(),
                       bleLastRSSI,
+                      configuredTargetMac.length() > 0 ? configuredTargetMac.c_str() : "NONE",
                       tcpClient && tcpClient.connected() ? "CONNECTED" : "WAITING",
                       wsServer.connectedClients(),
                       ESP.getFreeHeap());

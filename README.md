@@ -6,15 +6,16 @@ This repository contains an ESP32-C3 PlatformIO application that acts as a BLE b
 
 ## 🌟 Features
 
-- **Automatic BLE Client Bridge**:
-  - Automatically scans and pairs with MeshCore devices advertising NUS (`6e400001-b5a3-f393-e0a9-e50e24dcca9e`).
-  - Supports BLE Security / Bonding with passkey (PIN: `808978`).
-  - Subscribes to TX notifications (`6e400003-...`) and forwards to all connected TCP / WebSocket clients.
-  - Receives frames from TCP / WebSocket clients and writes to BLE RX (`6e400002-...`).
-  - Auto-reconnects with backoff if the BLE device goes out of range or disconnects.
+- **Bluetooth Device Manager & Web Configuration**:
+  - **Live BLE Device Scanner**: Discover nearby Bluetooth devices on demand from the Web UI.
+  - **Candidate Filtering**: Automatically highlights valid MeshCore / Nordic UART candidates.
+  - **Show All Devices Filter**: Optional checkbox to display all discovered Bluetooth devices regardless of name or advertising service.
+  - **Configurable PIN / Passkey**: Enter custom pairing PINs (defaults to `808978`).
+  - **NVS Persistent Memory**: Saves selected target MAC address, PIN, and auto-reconnect preference across reboots.
+  - **GATT Bridge**: Subscribes to TX notifications (`6e400003-...`) and forwards to all TCP / WebSocket clients.
 
 - **Dual Network Transports & Web Console**:
-  - **Interactive Web Console & Dashboard (Ports `80` & `5000`)**: Full in-browser web app with live LoRa mesh chat, node queries, beacon broadcast, time sync, battery monitor, and live protocol packet inspector.
+  - **Interactive Web Console & Dashboard (Ports `80` & `5000`)**: Full in-browser web app with live LoRa mesh chat, node queries, beacon broadcast, time sync, battery monitor, live protocol packet inspector, and Bluetooth configuration manager.
   - **Raw TCP Server (Port `5000`)**: Standard MeshCore framing (`<` for TX, `>` for RX) for native apps and CLI clients.
   - **WebSocket Server (Port `5001`)**: Binary WebSocket transport for Web browsers (MeshCore Open Web).
 
