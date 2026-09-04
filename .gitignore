@@ -4,3 +4,4 @@
 .vscode
 meshcore-fw/
 compile_commands.json
+agent_workspaces/
