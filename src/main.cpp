@@ -18,6 +18,7 @@
 #include <host/ble_store.h>
 #endif
 #include <Preferences.h>
+#include <lwip/sockets.h>
 #include <vector>
 
 // ================= Configuration =================
@@ -80,16 +81,53 @@ static uint32_t blePacketsTx = 0;
 static uint32_t bleConnectTime = 0;
 static uint32_t blePinCode = DEFAULT_BLE_PIN;
 
-static WiFiServer tcpServer(TCP_PORT);
-static WiFiClient tcpClient;
+#define MAX_TCP_CLIENTS           4
+#define TCP_KEEPALIVE_IDLE_SEC    5    // Start keepalive probes after 5 seconds of idle
+#define TCP_KEEPALIVE_INTVL_SEC   3    // Keepalive probe interval: 3 seconds
+#define TCP_KEEPALIVE_COUNT       3    // Drop connection after 3 unacknowledged probes (~14s detection)
+#define TCP_FRAME_TIMEOUT_MS      5000 // Incomplete frame assembly timeout
+
+// TCP client slot structure for multi-client pool
+struct TCPClientSlot {
+    WiFiClient client;
+    uint8_t rxBuffer[MAX_FRAME_SIZE + 4];
+    size_t rxLen = 0;
+    size_t expectedLen = 0;
+    uint8_t parseState = 0; // 0: Idle, 1: Got '<', 2: Got Len1, 3: Reading payload
+    unsigned long connectTime = 0;
+    unsigned long lastActivity = 0;
+
+    void resetParser() {
+        rxLen = 0;
+        expectedLen = 0;
+        parseState = 0;
+    }
+
+    void stop() {
+        if (client) {
+            client.stop();
+        }
+        resetParser();
+        connectTime = 0;
+        lastActivity = 0;
+    }
+};
+
+static WiFiServer tcpServer(TCP_PORT, MAX_TCP_CLIENTS);
+static TCPClientSlot tcpClients[MAX_TCP_CLIENTS];
 static WebSocketsServer wsServer(WS_PORT);
 static WebServer httpServer(HTTP_PORT);
 
-// TCP frame parser state
-static uint8_t tcpRxBuffer[MAX_FRAME_SIZE + 4];
-static size_t tcpRxLen = 0;
-static size_t tcpExpectedLen = 0;
-static uint8_t tcpParseState = 0; // 0: Idle, 1: Got '<', 2: Got Len1, 3: Reading payload
+// Helper to count active connected TCP clients
+static int getConnectedTCPClientCount() {
+    int count = 0;
+    for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+        if (tcpClients[i].client && tcpClients[i].client.connected()) {
+            count++;
+        }
+    }
+    return count;
+}
 
 // Global Statistics
 static uint32_t tcpClientsTotal = 0;
@@ -516,6 +554,29 @@ void sendFrameToMeshCore(const uint8_t* data, size_t len) {
     pRxCharacteristic->writeValue((uint8_t*)data, len, false);
 }
 
+// Configure TCP socket options including keepalive and no-delay
+static void configureTCPClientSocket(WiFiClient& client) {
+    client.setNoDelay(true);
+
+    int enableKeepAlive = 1;
+    int keepIdle = TCP_KEEPALIVE_IDLE_SEC;
+    int keepInterval = TCP_KEEPALIVE_INTVL_SEC;
+    int keepCount = TCP_KEEPALIVE_COUNT;
+
+    if (client.setSocketOption(SOL_SOCKET, SO_KEEPALIVE, &enableKeepAlive, sizeof(enableKeepAlive)) < 0) {
+        Serial.println("[TCP] Warning: Failed to set SO_KEEPALIVE");
+    }
+    if (client.setSocketOption(IPPROTO_TCP, TCP_KEEPIDLE, &keepIdle, sizeof(keepIdle)) < 0) {
+        Serial.println("[TCP] Warning: Failed to set TCP_KEEPIDLE");
+    }
+    if (client.setSocketOption(IPPROTO_TCP, TCP_KEEPINTVL, &keepInterval, sizeof(keepInterval)) < 0) {
+        Serial.println("[TCP] Warning: Failed to set TCP_KEEPINTVL");
+    }
+    if (client.setSocketOption(IPPROTO_TCP, TCP_KEEPCNT, &keepCount, sizeof(keepCount)) < 0) {
+        Serial.println("[TCP] Warning: Failed to set TCP_KEEPCNT");
+    }
+}
+
 // Wrap frame with MeshCore USB/TCP framing: '>' [len LSB] [len MSB] [payload]
 void broadcastFrameToClients(const uint8_t* data, size_t len) {
     if (len > MAX_FRAME_SIZE) return;
@@ -527,10 +588,13 @@ void broadcastFrameToClients(const uint8_t* data, size_t len) {
     memcpy(packet + 3, data, len);
     size_t packetLen = len + 3;
 
-    // Send to TCP client
-    if (tcpClient && tcpClient.connected()) {
-        tcpClient.write(packet, packetLen);
-        tcpPacketsTx++;
+    // Send to all active TCP clients in the pool
+    for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+        if (tcpClients[i].client && tcpClients[i].client.connected()) {
+            tcpClients[i].client.write(packet, packetLen);
+            tcpPacketsTx++;
+            tcpClients[i].lastActivity = millis();
+        }
     }
 
     // Send to WebSocket clients
@@ -542,88 +606,103 @@ void broadcastFrameToClients(const uint8_t* data, size_t len) {
 
 // Parse incoming data from TCP stream on port 5000 (handles MeshCore frames AND browser HTTP requests)
 void handleTCPClientData() {
-    if (!tcpClient || !tcpClient.connected()) {
-        if (tcpClient) {
-            tcpClient.stop();
-            Serial.println("[TCP] Client disconnected.");
+    for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+        TCPClientSlot& slot = tcpClients[i];
+        if (!slot.client) continue;
+
+        // Cleanly disconnect and free slot when client disconnected
+        if (!slot.client.connected()) {
+            Serial.printf("[TCP] Client #%d disconnected.\n", i);
+            slot.stop();
+            continue;
         }
-        return;
-    }
 
-    if (!tcpClient.available()) return;
+        // Check if data is available
+        if (!slot.client.available()) {
+            // Partial frame reception watchdog: reset parser if incomplete frame stalled >5s
+            if (slot.parseState != 0 && (millis() - slot.lastActivity > TCP_FRAME_TIMEOUT_MS)) {
+                Serial.printf("[TCP] Client #%d frame assembly timed out; resetting parser state\n", i);
+                slot.resetParser();
+            }
+            continue;
+        }
 
-    // If waiting for start of frame, check if this is an HTTP request from a browser
-    if (tcpParseState == 0) {
-        int firstByte = tcpClient.peek();
-        if (firstByte == 'G' || firstByte == 'P' || firstByte == 'H' || firstByte == 'O') {
-            String req = "";
-            unsigned long startWait = millis();
-            while (tcpClient.connected() && millis() - startWait < 1500) {
-                while (tcpClient.available()) {
-                    char c = tcpClient.read();
-                    req += c;
+        slot.lastActivity = millis();
+
+        // If waiting for start of frame, check if this is an HTTP request from a browser
+        if (slot.parseState == 0) {
+            int firstByte = slot.client.peek();
+            if (firstByte == 'G' || firstByte == 'P' || firstByte == 'H' || firstByte == 'O') {
+                String req = "";
+                unsigned long startWait = millis();
+                while (slot.client.connected() && millis() - startWait < 1500) {
+                    while (slot.client.available()) {
+                        char c = slot.client.read();
+                        req += c;
+                        if (req.endsWith("\r\n\r\n")) break;
+                    }
                     if (req.endsWith("\r\n\r\n")) break;
+                    delay(2);
                 }
-                if (req.endsWith("\r\n\r\n")) break;
-                delay(2);
-            }
-            Serial.printf("[TCP:5000] HTTP Request: %s\n", req.substring(0, req.indexOf('\r')).c_str());
+                Serial.printf("[TCP:5000] Client #%d HTTP Request: %s\n", i, req.substring(0, req.indexOf('\r')).c_str());
 
-            if (req.indexOf("GET /status") >= 0) {
-                String json = getStatusJSON();
-                String resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + String(json.length()) + "\r\nConnection: close\r\n\r\n" + json;
-                tcpClient.print(resp);
-            } else if (req.indexOf("GET /api/devices") >= 0) {
-                String json = getDevicesJSON();
-                String resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + String(json.length()) + "\r\nConnection: close\r\n\r\n" + json;
-                tcpClient.print(resp);
-            } else if (req.indexOf("GET /api/bonds") >= 0) {
-                String json = getBondsJSON();
-                String resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + String(json.length()) + "\r\nConnection: close\r\n\r\n" + json;
-                tcpClient.print(resp);
-            } else {
-                String html = getDashboardHTML();
-                String resp = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: " + String(html.length()) + "\r\nConnection: close\r\n\r\n" + html;
-                tcpClient.print(resp);
-            }
-            tcpClient.flush();
-            tcpClient.stop();
-            return;
-        }
-    }
-
-    // Binary MeshCore companion stream parser
-    while (tcpClient.available()) {
-        int c = tcpClient.read();
-        if (c < 0) break;
-
-        switch (tcpParseState) {
-            case 0: // Waiting for '<'
-                if (c == USB_SERIAL_TX_FRAME_START) {
-                    tcpParseState = 1;
-                }
-                break;
-            case 1: // Got '<', read length LSB
-                tcpExpectedLen = (uint8_t)c;
-                tcpParseState = 2;
-                break;
-            case 2: // Read length MSB
-                tcpExpectedLen |= ((uint16_t)c) << 8;
-                tcpRxLen = 0;
-                if (tcpExpectedLen == 0 || tcpExpectedLen > MAX_FRAME_SIZE) {
-                    tcpParseState = 0; // Invalid length
+                if (req.indexOf("GET /status") >= 0) {
+                    String json = getStatusJSON();
+                    String resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + String(json.length()) + "\r\nConnection: close\r\n\r\n" + json;
+                    slot.client.print(resp);
+                } else if (req.indexOf("GET /api/devices") >= 0) {
+                    String json = getDevicesJSON();
+                    String resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + String(json.length()) + "\r\nConnection: close\r\n\r\n" + json;
+                    slot.client.print(resp);
+                } else if (req.indexOf("GET /api/bonds") >= 0) {
+                    String json = getBondsJSON();
+                    String resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + String(json.length()) + "\r\nConnection: close\r\n\r\n" + json;
+                    slot.client.print(resp);
                 } else {
-                    tcpParseState = 3;
+                    String html = getDashboardHTML();
+                    String resp = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: " + String(html.length()) + "\r\nConnection: close\r\n\r\n" + html;
+                    slot.client.print(resp);
                 }
-                break;
-            case 3: // Read payload
-                tcpRxBuffer[tcpRxLen++] = (uint8_t)c;
-                if (tcpRxLen >= tcpExpectedLen) {
-                    tcpPacketsRx++;
-                    sendFrameToMeshCore(tcpRxBuffer, tcpExpectedLen);
-                    tcpParseState = 0;
-                }
-                break;
+                slot.client.flush();
+                slot.stop();
+                continue;
+            }
+        }
+
+        // Binary MeshCore companion stream parser
+        while (slot.client.available()) {
+            int c = slot.client.read();
+            if (c < 0) break;
+            slot.lastActivity = millis();
+
+            switch (slot.parseState) {
+                case 0: // Waiting for '<'
+                    if (c == USB_SERIAL_TX_FRAME_START) {
+                        slot.parseState = 1;
+                    }
+                    break;
+                case 1: // Got '<', read length LSB
+                    slot.expectedLen = (uint8_t)c;
+                    slot.parseState = 2;
+                    break;
+                case 2: // Read length MSB
+                    slot.expectedLen |= ((uint16_t)c) << 8;
+                    slot.rxLen = 0;
+                    if (slot.expectedLen == 0 || slot.expectedLen > MAX_FRAME_SIZE) {
+                        slot.parseState = 0; // Invalid length
+                    } else {
+                        slot.parseState = 3;
+                    }
+                    break;
+                case 3: // Read payload
+                    slot.rxBuffer[slot.rxLen++] = (uint8_t)c;
+                    if (slot.rxLen >= slot.expectedLen) {
+                        tcpPacketsRx++;
+                        sendFrameToMeshCore(slot.rxBuffer, slot.expectedLen);
+                        slot.parseState = 0;
+                    }
+                    break;
+            }
         }
     }
 }
@@ -686,6 +765,8 @@ String getStatusJSON() {
     json += "\"wifi_rssi\":" + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0) + ",";
     json += "\"ip_address\":\"" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : (isAPMode ? WiFi.softAPIP().toString() : "")) + "\",";
     json += "\"tcp_port\":" + String(TCP_PORT) + ",";
+    json += "\"tcp_clients\":" + String(getConnectedTCPClientCount()) + ",";
+    json += "\"tcp_clients_max\":" + String(MAX_TCP_CLIENTS) + ",";
     json += "\"ws_port\":" + String(WS_PORT) + ",";
     json += "\"free_heap\":" + String(ESP.getFreeHeap()) + ",";
     json += "\"uptime_sec\":" + String(millis() / 1000);
@@ -1797,7 +1878,7 @@ void setup() {
     // 4. Start TCP Server on port 5000
     tcpServer.begin();
     tcpServer.setNoDelay(true);
-    Serial.printf("[TCP] Server listening on port %d\n", TCP_PORT);
+    Serial.printf("[TCP] Server listening on port %d (max clients: %d)\n", TCP_PORT, MAX_TCP_CLIENTS);
 
     // 5. Start WebSocket Server on port 5001
     wsServer.begin();
@@ -1885,20 +1966,44 @@ void loop() {
     wsServer.loop();
 
     // 3. Handle incoming TCP connections (port 5000)
-    if (!tcpClient || !tcpClient.connected()) {
-        WiFiClient newClient = tcpServer.accept();
-        if (newClient) {
-            tcpClient = newClient;
-            tcpClient.setNoDelay(true);
-            tcpParseState = 0;
-            tcpRxLen = 0;
-            tcpClientsTotal++;
-            Serial.printf("[TCP] New client connected from %s:%d\n",
-                          tcpClient.remoteIP().toString().c_str(), tcpClient.remotePort());
+    if (tcpServer.hasClient()) {
+        int freeSlot = -1;
+        for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+            if (!tcpClients[i].client || !tcpClients[i].client.connected()) {
+                freeSlot = i;
+                break;
+            }
         }
-    } else {
-        handleTCPClientData();
+
+        if (freeSlot >= 0) {
+            tcpClients[freeSlot].stop();
+            tcpClients[freeSlot].client = tcpServer.accept();
+            if (tcpClients[freeSlot].client) {
+                configureTCPClientSocket(tcpClients[freeSlot].client);
+                tcpClients[freeSlot].resetParser();
+                tcpClients[freeSlot].connectTime = millis();
+                tcpClients[freeSlot].lastActivity = millis();
+                tcpClientsTotal++;
+                Serial.printf("[TCP] Client #%d connected from %s:%d\n",
+                              freeSlot,
+                              tcpClients[freeSlot].client.remoteIP().toString().c_str(),
+                              tcpClients[freeSlot].client.remotePort());
+            }
+        } else {
+            // Connection pool full; cleanly reject to avoid stalling client and lwIP exhaustion
+            WiFiClient rejected = tcpServer.accept();
+            if (rejected) {
+                Serial.printf("[TCP] Connection pool full (%d/%d), rejecting client from %s:%d\n",
+                              MAX_TCP_CLIENTS, MAX_TCP_CLIENTS,
+                              rejected.remoteIP().toString().c_str(),
+                              rejected.remotePort());
+                rejected.stop();
+            }
+        }
     }
+
+    // Process TCP client traffic and disconnections
+    handleTCPClientData();
 
     // 4. Handle WiFi reconnection in Station mode
     if (!isAPMode && wifiSSID.length() > 0 && millis() - lastWiFiCheck > 15000) {
@@ -1938,13 +2043,15 @@ void loop() {
     if (millis() - lastStatusPrint > 10000) {
         lastStatusPrint = millis();
         String netStr = WiFi.status() == WL_CONNECTED ? ("STA: " + WiFi.SSID() + " (" + WiFi.localIP().toString() + ")") : (isAPMode ? ("AP: " + apSSID + " (192.168.4.1)") : "DISCONNECTED");
+        int tcpCount = getConnectedTCPClientCount();
+        String tcpStatus = tcpCount > 0 ? (String(tcpCount) + "/" + String(MAX_TCP_CLIENTS) + " CLIENTS") : "WAITING";
         Serial.printf("[STATUS] %s | BLE: %s (%s, RSSI: %d) | Target: %s | TCP: %s | WS Clients: %u | Free Heap: %u\n",
                       netStr.c_str(),
                       bleConnected ? "CONNECTED" : (bleConnecting ? "CONNECTING" : "DISCONNECTED"),
                       bleConnectedDeviceName.c_str(),
                       bleLastRSSI,
                       configuredTargetMac.length() > 0 ? configuredTargetMac.c_str() : "NONE",
-                      tcpClient && tcpClient.connected() ? "CONNECTED" : "WAITING",
+                      tcpStatus.c_str(),
                       wsServer.connectedClients(),
                       ESP.getFreeHeap());
     }
