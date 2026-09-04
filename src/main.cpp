@@ -64,6 +64,11 @@ static uint32_t configuredPinCode = DEFAULT_BLE_PIN;
 static bool autoConnectEnabled = true;
 static bool bleScanning = false;
 static unsigned long scanStartTime = 0;
+static unsigned long lastScanAttempt = 0;
+static unsigned long scanBackoffInterval = 10000;
+const unsigned long MIN_SCAN_BACKOFF = 10000;
+const unsigned long MAX_SCAN_BACKOFF = 60000;
+const unsigned long SCAN_BACKOFF_STEP = 10000;
 
 static BLEAddress* pTargetAddress = nullptr;
 static BLEClient* pClient = nullptr;
@@ -199,6 +204,11 @@ class BridgeClientCallbacks : public BLEClientCallbacks {
         bleConnected = true;
         bleConnecting = false;
         bleConnectTime = millis();
+        scanBackoffInterval = MIN_SCAN_BACKOFF;
+        if (bleConnected && bleScanning) {
+            BLEDevice::getScan()->stop();
+            bleScanning = false;
+        }
     }
     void onDisconnect(BLEClient* pclient) override {
         Serial.println("[BLE] Disconnected from MeshCore device!");
@@ -206,6 +216,8 @@ class BridgeClientCallbacks : public BLEClientCallbacks {
         bleConnecting = false;
         pRxCharacteristic = nullptr;
         pTxCharacteristic = nullptr;
+        scanBackoffInterval = MIN_SCAN_BACKOFF;
+        lastScanAttempt = millis();
     }
 };
 
@@ -273,6 +285,7 @@ class BridgeAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
                               name.c_str(), addr.c_str(), rssi);
                 BLEDevice::getScan()->stop();
                 bleScanning = false;
+                scanBackoffInterval = MIN_SCAN_BACKOFF;
                 if (pTargetAddress) delete pTargetAddress;
                 pTargetAddress = new BLEAddress(advertisedDevice.getAddress());
                 bleConnectedDeviceName = name.length() > 0 ? name : "MeshCore Device";
@@ -497,6 +510,11 @@ bool connectToMeshCoreDevice() {
 
     bleConnected = true;
     bleConnecting = false;
+    scanBackoffInterval = MIN_SCAN_BACKOFF;
+    if (bleConnected && bleScanning) {
+        BLEDevice::getScan()->stop();
+        bleScanning = false;
+    }
     return true;
 }
 
@@ -1851,14 +1869,13 @@ void setup() {
     BLEScan* pBLEScan = BLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new BridgeAdvertisedDeviceCallbacks());
     pBLEScan->setActiveScan(true);
-    pBLEScan->setInterval(100);
-    pBLEScan->setWindow(99);
+    pBLEScan->setInterval(160);
+    pBLEScan->setWindow(40);
 
     Serial.println("[BLE] Starting initial discovery scan...");
     startBLEScan(5, true);
 }
 
-static unsigned long lastScanAttempt = 0;
 static unsigned long lastStatusPrint = 0;
 static unsigned long lastWiFiCheck = 0;
 
@@ -1913,18 +1930,31 @@ void loop() {
     if (bleConnecting) {
         if (connectToMeshCoreDevice()) {
             Serial.println("[BLE] Connection established and ready to bridge!");
+            scanBackoffInterval = MIN_SCAN_BACKOFF;
         } else {
-            Serial.println("[BLE] Connection attempt failed, will retry scan in 5 seconds...");
+            Serial.println("[BLE] Connection attempt failed, will retry scan...");
             delay(1000);
             bleConnecting = false;
+            lastScanAttempt = millis();
         }
     } else if (!bleConnected) {
         if (autoConnectEnabled && configuredTargetMac.length() > 0) {
-            if (millis() - lastScanAttempt > 10000 && !bleScanning) {
+            if (millis() - lastScanAttempt > scanBackoffInterval && !bleScanning) {
                 lastScanAttempt = millis();
+                Serial.printf("[BLE] Offline reconnect scan attempt (interval: %lu ms, backoff: %lu s)...\n",
+                              scanBackoffInterval, scanBackoffInterval / 1000);
                 startBLEScan(5, false);
+                if (scanBackoffInterval < MAX_SCAN_BACKOFF) {
+                    scanBackoffInterval = min(MAX_SCAN_BACKOFF, scanBackoffInterval + SCAN_BACKOFF_STEP);
+                }
             }
         }
+    }
+
+    // Ensure background discovery scans are immediately stopped if BLE is connected
+    if (bleConnected && bleScanning) {
+        BLEDevice::getScan()->stop();
+        bleScanning = false;
     }
 
     // Scan timeout watchdog
