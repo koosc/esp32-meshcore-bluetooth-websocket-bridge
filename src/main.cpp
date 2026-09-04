@@ -540,59 +540,21 @@ void broadcastFrameToClients(const uint8_t* data, size_t len) {
     }
 }
 
-// Parse incoming data from TCP stream on port 5000 (handles MeshCore frames AND browser HTTP requests)
+// Parse incoming data from TCP stream on port 5000 (strictly dedicated to MeshCore binary protocol stream)
 void handleTCPClientData() {
     if (!tcpClient || !tcpClient.connected()) {
         if (tcpClient) {
             tcpClient.stop();
             Serial.println("[TCP] Client disconnected.");
         }
+        tcpParseState = 0;
+        tcpRxLen = 0;
         return;
     }
 
     if (!tcpClient.available()) return;
 
-    // If waiting for start of frame, check if this is an HTTP request from a browser
-    if (tcpParseState == 0) {
-        int firstByte = tcpClient.peek();
-        if (firstByte == 'G' || firstByte == 'P' || firstByte == 'H' || firstByte == 'O') {
-            String req = "";
-            unsigned long startWait = millis();
-            while (tcpClient.connected() && millis() - startWait < 1500) {
-                while (tcpClient.available()) {
-                    char c = tcpClient.read();
-                    req += c;
-                    if (req.endsWith("\r\n\r\n")) break;
-                }
-                if (req.endsWith("\r\n\r\n")) break;
-                delay(2);
-            }
-            Serial.printf("[TCP:5000] HTTP Request: %s\n", req.substring(0, req.indexOf('\r')).c_str());
-
-            if (req.indexOf("GET /status") >= 0) {
-                String json = getStatusJSON();
-                String resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + String(json.length()) + "\r\nConnection: close\r\n\r\n" + json;
-                tcpClient.print(resp);
-            } else if (req.indexOf("GET /api/devices") >= 0) {
-                String json = getDevicesJSON();
-                String resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + String(json.length()) + "\r\nConnection: close\r\n\r\n" + json;
-                tcpClient.print(resp);
-            } else if (req.indexOf("GET /api/bonds") >= 0) {
-                String json = getBondsJSON();
-                String resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + String(json.length()) + "\r\nConnection: close\r\n\r\n" + json;
-                tcpClient.print(resp);
-            } else {
-                String html = getDashboardHTML();
-                String resp = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: " + String(html.length()) + "\r\nConnection: close\r\n\r\n" + html;
-                tcpClient.print(resp);
-            }
-            tcpClient.flush();
-            tcpClient.stop();
-            return;
-        }
-    }
-
-    // Binary MeshCore companion stream parser
+    // Binary MeshCore companion stream parser (<len_lsb><len_msb><payload>)
     while (tcpClient.available()) {
         int c = tcpClient.read();
         if (c < 0) break;
@@ -611,17 +573,25 @@ void handleTCPClientData() {
                 tcpExpectedLen |= ((uint16_t)c) << 8;
                 tcpRxLen = 0;
                 if (tcpExpectedLen == 0 || tcpExpectedLen > MAX_FRAME_SIZE) {
-                    tcpParseState = 0; // Invalid length
+                    tcpParseState = 0; // Invalid or corrupt frame length: reset immediately without blocking
                 } else {
                     tcpParseState = 3;
                 }
                 break;
             case 3: // Read payload
-                tcpRxBuffer[tcpRxLen++] = (uint8_t)c;
+                if (tcpRxLen < MAX_FRAME_SIZE) {
+                    tcpRxBuffer[tcpRxLen++] = (uint8_t)c;
+                } else {
+                    // Corrupt or out-of-bounds frame: reset immediately without blocking
+                    tcpParseState = 0;
+                    tcpRxLen = 0;
+                    break;
+                }
                 if (tcpRxLen >= tcpExpectedLen) {
                     tcpPacketsRx++;
                     sendFrameToMeshCore(tcpRxBuffer, tcpExpectedLen);
                     tcpParseState = 0;
+                    tcpRxLen = 0;
                 }
                 break;
         }
