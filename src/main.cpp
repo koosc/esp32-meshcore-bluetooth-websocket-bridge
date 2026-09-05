@@ -20,6 +20,7 @@
 #include <Preferences.h>
 #include <vector>
 #include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <freertos/queue.h>
 
 // ================= Configuration =================
@@ -56,6 +57,7 @@ struct DiscoveredDevice {
 
 // ================= State Variables =================
 static std::vector<DiscoveredDevice> discoveredDevices;
+static SemaphoreHandle_t devicesMutex = nullptr;
 static Preferences preferences;
 
 // Wi-Fi & Soft AP Portal State
@@ -225,7 +227,12 @@ class BridgeClientCallbacks : public BLEClientCallbacks {
 // ================= BLE Advertised Device Callbacks =================
 static void onScanComplete(BLEScanResults scanResults) {
     bleScanning = false;
-    Serial.printf("[SCAN] Scan complete. Total discovered devices: %d\n", (int)discoveredDevices.size());
+    int count = 0;
+    if (devicesMutex && xSemaphoreTake(devicesMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        count = (int)discoveredDevices.size();
+        xSemaphoreGive(devicesMutex);
+    }
+    Serial.printf("[SCAN] Scan complete. Total discovered devices: %d\n", count);
 }
 
 class BridgeAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
@@ -255,28 +262,31 @@ class BridgeAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
         bool isCandidate = hasUUID || matchName;
 
         bool found = false;
-        for (auto& dev : discoveredDevices) {
-            if (dev.address.equalsIgnoreCase(addr)) {
-                found = true;
-                if (name.length() > 0 && dev.name.length() == 0) {
-                    dev.name = name;
+        if (devicesMutex && xSemaphoreTake(devicesMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            for (auto& dev : discoveredDevices) {
+                if (dev.address.equalsIgnoreCase(addr)) {
+                    found = true;
+                    if (name.length() > 0 && dev.name.length() == 0) {
+                        dev.name = name;
+                    }
+                    dev.rssi = rssi;
+                    dev.isMeshCandidate = dev.isMeshCandidate || isCandidate;
+                    dev.hasServiceUUID = dev.hasServiceUUID || hasUUID;
+                    dev.lastSeen = millis();
+                    break;
                 }
-                dev.rssi = rssi;
-                dev.isMeshCandidate = dev.isMeshCandidate || isCandidate;
-                dev.hasServiceUUID = dev.hasServiceUUID || hasUUID;
-                dev.lastSeen = millis();
-                break;
             }
-        }
-        if (!found && discoveredDevices.size() < 60) {
-            DiscoveredDevice d;
-            d.address = addr;
-            d.name = name;
-            d.rssi = rssi;
-            d.isMeshCandidate = isCandidate;
-            d.hasServiceUUID = hasUUID;
-            d.lastSeen = millis();
-            discoveredDevices.push_back(d);
+            if (!found && discoveredDevices.size() < 60) {
+                DiscoveredDevice d;
+                d.address = addr;
+                d.name = name;
+                d.rssi = rssi;
+                d.isMeshCandidate = isCandidate;
+                d.hasServiceUUID = hasUUID;
+                d.lastSeen = millis();
+                discoveredDevices.push_back(d);
+            }
+            xSemaphoreGive(devicesMutex);
         }
 
         // Auto-connect to configured target MAC if set and enabled
@@ -304,7 +314,10 @@ void startBLEScan(int durationSec, bool clearList) {
         delay(50);
     }
     if (clearList) {
-        discoveredDevices.clear();
+        if (devicesMutex && xSemaphoreTake(devicesMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            discoveredDevices.clear();
+            xSemaphoreGive(devicesMutex);
+        }
     }
     Serial.printf("[BLE] Starting background scan for %d seconds...\n", durationSec);
     pScan->clearResults();
@@ -733,14 +746,19 @@ String getDevicesJSON() {
     json += "\"connected_mac\":\"" + sanitizeJSONString(bleConnected ? bleConnectedAddress : "") + "\",";
     json += "\"connected_name\":\"" + sanitizeJSONString(bleConnected ? bleConnectedDeviceName : "") + "\",";
     json += "\"devices\":[";
-    for (size_t i = 0; i < discoveredDevices.size(); i++) {
+    std::vector<DiscoveredDevice> devList;
+    if (devicesMutex && xSemaphoreTake(devicesMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        devList = discoveredDevices;
+        xSemaphoreGive(devicesMutex);
+    }
+    for (size_t i = 0; i < devList.size(); i++) {
         if (i > 0) json += ",";
         json += "{";
-        json += "\"address\":\"" + sanitizeJSONString(discoveredDevices[i].address) + "\",";
-        json += "\"name\":\"" + sanitizeJSONString(discoveredDevices[i].name) + "\",";
-        json += "\"rssi\":" + String(discoveredDevices[i].rssi) + ",";
-        json += "\"is_mesh\":" + String(discoveredDevices[i].isMeshCandidate ? "true" : "false") + ",";
-        json += "\"connected\":" + String(bleConnected && bleConnectedAddress.equalsIgnoreCase(discoveredDevices[i].address) ? "true" : "false");
+        json += "\"address\":\"" + sanitizeJSONString(devList[i].address) + "\",";
+        json += "\"name\":\"" + sanitizeJSONString(devList[i].name) + "\",";
+        json += "\"rssi\":" + String(devList[i].rssi) + ",";
+        json += "\"is_mesh\":" + String(devList[i].isMeshCandidate ? "true" : "false") + ",";
+        json += "\"connected\":" + String(bleConnected && bleConnectedAddress.equalsIgnoreCase(devList[i].address) ? "true" : "false");
         json += "}";
     }
     json += "]}";
@@ -859,7 +877,10 @@ void handleDeleteBond() {
 
 void handleClearDiscoveredCache() {
     httpServer.sendHeader("Access-Control-Allow-Origin", "*");
-    discoveredDevices.clear();
+    if (devicesMutex && xSemaphoreTake(devicesMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        discoveredDevices.clear();
+        xSemaphoreGive(devicesMutex);
+    }
     BLEDevice::getScan()->clearResults();
     Serial.println("[SCAN] Cleared discovered devices cache.");
     httpServer.send(200, "application/json", "{\"status\":\"Discovered devices cache cleared\"}");
@@ -908,11 +929,14 @@ void handleConnect() {
     if (pTargetAddress) delete pTargetAddress;
     pTargetAddress = new BLEAddress(address.c_str());
     bleConnectedDeviceName = address;
-    for (const auto& dev : discoveredDevices) {
-        if (dev.address.equalsIgnoreCase(address) && dev.name.length() > 0) {
-            bleConnectedDeviceName = dev.name;
-            break;
+    if (devicesMutex && xSemaphoreTake(devicesMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        for (const auto& dev : discoveredDevices) {
+            if (dev.address.equalsIgnoreCase(address) && dev.name.length() > 0) {
+                bleConnectedDeviceName = dev.name;
+                break;
+            }
         }
+        xSemaphoreGive(devicesMutex);
     }
     bleConnectedAddress = address;
     bleConnecting = true;
@@ -1784,6 +1808,9 @@ void setup() {
     Serial.println("\n\n========================================");
     Serial.printf("  ESP32-C3 MeshCore BLE Bridge v%s\n", BRIDGE_VERSION);
     Serial.println("========================================");
+
+    // Initialize FreeRTOS mutex for discovered devices list
+    devicesMutex = xSemaphoreCreateMutex();
 
     // Initialize BLE incoming RX queue
     bleRxQueue = xQueueCreate(16, sizeof(BleFrame));
