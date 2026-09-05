@@ -206,6 +206,8 @@ void forgetWiFiPreferences();
 void serviceNetworkClients();
 void startWiFiConnect(const String& ssid, const String& pass);
 bool connectWiFi(const String& ssid, const String& pass, int timeoutSec = 12);
+static void configureTCPClientSocket(WiFiClient& client);
+static void acceptNewTCPClients();
 void handleTCPClientData();
 void startAPMode();
 void stopAPMode();
@@ -438,6 +440,45 @@ void forgetPreferences() {
 }
 
 // ================= Wi-Fi & Soft AP Management =================
+// Accept a pending TCP connection into the client pool (or reject when full)
+static void acceptNewTCPClients() {
+    if (!tcpServer.hasClient()) return;
+
+    int freeSlot = -1;
+    for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+        if (!tcpClients[i].client || !tcpClients[i].client.connected()) {
+            freeSlot = i;
+            break;
+        }
+    }
+
+    if (freeSlot >= 0) {
+        tcpClients[freeSlot].stop();
+        tcpClients[freeSlot].client = tcpServer.accept();
+        if (tcpClients[freeSlot].client) {
+            configureTCPClientSocket(tcpClients[freeSlot].client);
+            tcpClients[freeSlot].resetParser();
+            tcpClients[freeSlot].connectTime = millis();
+            tcpClients[freeSlot].lastActivity = millis();
+            tcpClientsTotal++;
+            Serial.printf("[TCP] Client #%d connected from %s:%d\n",
+                          freeSlot,
+                          tcpClients[freeSlot].client.remoteIP().toString().c_str(),
+                          tcpClients[freeSlot].client.remotePort());
+        }
+    } else {
+        // Connection pool full; cleanly reject to avoid stalling client and lwIP exhaustion
+        WiFiClient rejected = tcpServer.accept();
+        if (rejected) {
+            Serial.printf("[TCP] Connection pool full (%d/%d), rejecting client from %s:%d\n",
+                          MAX_TCP_CLIENTS, MAX_TCP_CLIENTS,
+                          rejected.remoteIP().toString().c_str(),
+                          rejected.remotePort());
+            rejected.stop();
+        }
+    }
+}
+
 void serviceNetworkClients() {
     if (isAPMode) {
         dnsServer.processNextRequest();
@@ -445,20 +486,8 @@ void serviceNetworkClients() {
     if (serversRunning) {
         httpServer.handleClient();
         wsServer.loop();
-        if (!tcpClient || !tcpClient.connected()) {
-            WiFiClient newClient = tcpServer.accept();
-            if (newClient) {
-                tcpClient = newClient;
-                tcpClient.setNoDelay(true);
-                tcpParseState = 0;
-                tcpRxLen = 0;
-                tcpClientsTotal++;
-                Serial.printf("[TCP] New client connected from %s:%d\n",
-                              tcpClient.remoteIP().toString().c_str(), tcpClient.remotePort());
-            }
-        } else {
-            handleTCPClientData();
-        }
+        acceptNewTCPClients();
+        handleTCPClientData();
     }
 }
 
@@ -1292,41 +1321,7 @@ void loop() {
     wsServer.loop();
 
     // 3. Handle incoming TCP connections (port 5000)
-    if (tcpServer.hasClient()) {
-        int freeSlot = -1;
-        for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
-            if (!tcpClients[i].client || !tcpClients[i].client.connected()) {
-                freeSlot = i;
-                break;
-            }
-        }
-
-        if (freeSlot >= 0) {
-            tcpClients[freeSlot].stop();
-            tcpClients[freeSlot].client = tcpServer.accept();
-            if (tcpClients[freeSlot].client) {
-                configureTCPClientSocket(tcpClients[freeSlot].client);
-                tcpClients[freeSlot].resetParser();
-                tcpClients[freeSlot].connectTime = millis();
-                tcpClients[freeSlot].lastActivity = millis();
-                tcpClientsTotal++;
-                Serial.printf("[TCP] Client #%d connected from %s:%d\n",
-                              freeSlot,
-                              tcpClients[freeSlot].client.remoteIP().toString().c_str(),
-                              tcpClients[freeSlot].client.remotePort());
-            }
-        } else {
-            // Connection pool full; cleanly reject to avoid stalling client and lwIP exhaustion
-            WiFiClient rejected = tcpServer.accept();
-            if (rejected) {
-                Serial.printf("[TCP] Connection pool full (%d/%d), rejecting client from %s:%d\n",
-                              MAX_TCP_CLIENTS, MAX_TCP_CLIENTS,
-                              rejected.remoteIP().toString().c_str(),
-                              rejected.remotePort());
-                rejected.stop();
-            }
-        }
-    }
+    acceptNewTCPClients();
 
     // Process TCP client traffic and disconnections
     handleTCPClientData();
