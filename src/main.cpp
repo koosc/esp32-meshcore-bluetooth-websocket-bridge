@@ -70,6 +70,10 @@ static String apSSID = "MeshCore-Bridge-Setup";
 static DNSServer dnsServer;
 static const byte DNS_PORT = 53;
 static bool wifiConnectPending = false;
+static bool wifiConnecting = false;
+static unsigned long wifiConnectStartTime = 0;
+static unsigned long wifiLastDot = 0;
+static bool serversRunning = false;
 static bool wifiScanning = false;
 
 static String configuredTargetMac = "";
@@ -199,7 +203,12 @@ void loadPreferences();
 void forgetPreferences();
 void saveWiFiPreferences(const String& ssid, const String& pass);
 void forgetWiFiPreferences();
+void serviceNetworkClients();
+void startWiFiConnect(const String& ssid, const String& pass);
 bool connectWiFi(const String& ssid, const String& pass, int timeoutSec = 12);
+static void configureTCPClientSocket(WiFiClient& client);
+static void acceptNewTCPClients();
+void handleTCPClientData();
 void startAPMode();
 void stopAPMode();
 
@@ -431,24 +440,87 @@ void forgetPreferences() {
 }
 
 // ================= Wi-Fi & Soft AP Management =================
-bool connectWiFi(const String& ssid, const String& pass, int timeoutSec) {
-    if (ssid.length() == 0) return false;
+// Accept a pending TCP connection into the client pool (or reject when full)
+static void acceptNewTCPClients() {
+    if (!tcpServer.hasClient()) return;
+
+    int freeSlot = -1;
+    for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+        if (!tcpClients[i].client || !tcpClients[i].client.connected()) {
+            freeSlot = i;
+            break;
+        }
+    }
+
+    if (freeSlot >= 0) {
+        tcpClients[freeSlot].stop();
+        tcpClients[freeSlot].client = tcpServer.accept();
+        if (tcpClients[freeSlot].client) {
+            configureTCPClientSocket(tcpClients[freeSlot].client);
+            tcpClients[freeSlot].resetParser();
+            tcpClients[freeSlot].connectTime = millis();
+            tcpClients[freeSlot].lastActivity = millis();
+            tcpClientsTotal++;
+            Serial.printf("[TCP] Client #%d connected from %s:%d\n",
+                          freeSlot,
+                          tcpClients[freeSlot].client.remoteIP().toString().c_str(),
+                          tcpClients[freeSlot].client.remotePort());
+        }
+    } else {
+        // Connection pool full; cleanly reject to avoid stalling client and lwIP exhaustion
+        WiFiClient rejected = tcpServer.accept();
+        if (rejected) {
+            Serial.printf("[TCP] Connection pool full (%d/%d), rejecting client from %s:%d\n",
+                          MAX_TCP_CLIENTS, MAX_TCP_CLIENTS,
+                          rejected.remoteIP().toString().c_str(),
+                          rejected.remotePort());
+            rejected.stop();
+        }
+    }
+}
+
+void serviceNetworkClients() {
+    if (isAPMode) {
+        dnsServer.processNextRequest();
+    }
+    if (serversRunning) {
+        httpServer.handleClient();
+        wsServer.loop();
+        acceptNewTCPClients();
+        handleTCPClientData();
+    }
+}
+
+void startWiFiConnect(const String& ssid, const String& pass) {
+    if (ssid.length() == 0) return;
     Serial.printf("[WiFi] Connecting to '%s'...\n", ssid.c_str());
     WiFi.disconnect();
-    delay(100);
+    for (int i = 0; i < 5; i++) {
+        serviceNetworkClients();
+        delay(10);
+        yield();
+    }
     WiFi.mode(isAPMode ? WIFI_AP_STA : WIFI_STA);
     WiFi.setSleep(false);
     WiFi.setAutoReconnect(true);
     WiFi.begin(ssid.c_str(), pass.length() > 0 ? pass.c_str() : nullptr);
+}
+
+bool connectWiFi(const String& ssid, const String& pass, int timeoutSec) {
+    if (ssid.length() == 0) return false;
+    startWiFiConnect(ssid, pass);
+    if (timeoutSec <= 0) return true;
 
     unsigned long start = millis();
+    unsigned long lastDot = 0;
     while (WiFi.status() != WL_CONNECTED && (millis() - start < (unsigned long)timeoutSec * 1000)) {
-        delay(250);
-        Serial.print(".");
-        if (isAPMode) {
-            dnsServer.processNextRequest();
-            httpServer.handleClient();
+        if (millis() - lastDot >= 250) {
+            lastDot = millis();
+            Serial.print(".");
         }
+        serviceNetworkClients();
+        delay(10);
+        yield();
     }
     Serial.println();
     if (WiFi.status() == WL_CONNECTED) {
@@ -763,6 +835,7 @@ String getStatusJSON() {
     json += "\"target_mac\":\"" + sanitizeJSONString(configuredTargetMac) + "\",";
     json += "\"auto_conn\":" + String(autoConnectEnabled ? "true" : "false") + ",";
     json += "\"wifi_connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+    json += "\"wifi_connecting\":" + String(wifiConnecting ? "true" : "false") + ",";
     json += "\"is_ap_mode\":" + String(isAPMode ? "true" : "false") + ",";
     json += "\"ap_ssid\":\"" + sanitizeJSONString(apSSID) + "\",";
     json += "\"ap_ip\":\"" + (isAPMode ? WiFi.softAPIP().toString() : "") + "\",";
@@ -1072,6 +1145,8 @@ void handleSaveWiFi() {
 
 void handleForgetWiFi() {
     httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+    wifiConnecting = false;
+    wifiConnectPending = false;
     forgetWiFiPreferences();
     WiFi.disconnect(true);
     if (!isAPMode) {
@@ -1187,6 +1262,8 @@ void setup() {
 
     Serial.println("[BLE] Starting initial discovery scan...");
     startBLEScan(5, true);
+
+    serversRunning = true;
 }
 
 static unsigned long lastStatusPrint = 0;
@@ -1201,13 +1278,34 @@ void loop() {
     // 1. Handle HTTP web requests (port 80)
     httpServer.handleClient();
 
-    // 1b. Handle pending Wi-Fi connection from Web UI
+    // 1b. Handle pending Wi-Fi connection from Web UI (asynchronous, non-blocking)
     if (wifiConnectPending) {
         wifiConnectPending = false;
-        Serial.printf("[WiFi] Initiating connection to '%s'...\n", wifiSSID.c_str());
-        bool ok = connectWiFi(wifiSSID, wifiPass, 12);
-        if (ok && isAPMode) {
-            stopAPMode();
+        wifiConnecting = true;
+        wifiConnectStartTime = millis();
+        wifiLastDot = millis();
+        startWiFiConnect(wifiSSID, wifiPass);
+    }
+
+    if (wifiConnecting) {
+        if (millis() - wifiLastDot >= 250) {
+            wifiLastDot = millis();
+            Serial.print(".");
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+            wifiConnecting = false;
+            Serial.println();
+            Serial.printf("[WiFi] Connected! IP: %s | Gateway: %s | RSSI: %d dBm\n",
+                          WiFi.localIP().toString().c_str(),
+                          WiFi.gatewayIP().toString().c_str(),
+                          WiFi.RSSI());
+            if (isAPMode) {
+                stopAPMode();
+            }
+        } else if (millis() - wifiConnectStartTime >= 12000) {
+            wifiConnecting = false;
+            Serial.println();
+            Serial.printf("[WiFi] Connection to '%s' timed out.\n", wifiSSID.c_str());
         }
     }
 
@@ -1223,47 +1321,13 @@ void loop() {
     wsServer.loop();
 
     // 3. Handle incoming TCP connections (port 5000)
-    if (tcpServer.hasClient()) {
-        int freeSlot = -1;
-        for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
-            if (!tcpClients[i].client || !tcpClients[i].client.connected()) {
-                freeSlot = i;
-                break;
-            }
-        }
-
-        if (freeSlot >= 0) {
-            tcpClients[freeSlot].stop();
-            tcpClients[freeSlot].client = tcpServer.accept();
-            if (tcpClients[freeSlot].client) {
-                configureTCPClientSocket(tcpClients[freeSlot].client);
-                tcpClients[freeSlot].resetParser();
-                tcpClients[freeSlot].connectTime = millis();
-                tcpClients[freeSlot].lastActivity = millis();
-                tcpClientsTotal++;
-                Serial.printf("[TCP] Client #%d connected from %s:%d\n",
-                              freeSlot,
-                              tcpClients[freeSlot].client.remoteIP().toString().c_str(),
-                              tcpClients[freeSlot].client.remotePort());
-            }
-        } else {
-            // Connection pool full; cleanly reject to avoid stalling client and lwIP exhaustion
-            WiFiClient rejected = tcpServer.accept();
-            if (rejected) {
-                Serial.printf("[TCP] Connection pool full (%d/%d), rejecting client from %s:%d\n",
-                              MAX_TCP_CLIENTS, MAX_TCP_CLIENTS,
-                              rejected.remoteIP().toString().c_str(),
-                              rejected.remotePort());
-                rejected.stop();
-            }
-        }
-    }
+    acceptNewTCPClients();
 
     // Process TCP client traffic and disconnections
     handleTCPClientData();
 
     // 4. Handle WiFi reconnection in Station mode
-    if (!isAPMode && wifiSSID.length() > 0 && millis() - lastWiFiCheck > 15000) {
+    if (!isAPMode && !wifiConnecting && wifiSSID.length() > 0 && millis() - lastWiFiCheck > 15000) {
         lastWiFiCheck = millis();
         if (WiFi.status() != WL_CONNECTED) {
             Serial.println("[WiFi] Reconnecting...");
