@@ -15,14 +15,14 @@ This repository contains an ESP32-C3 PlatformIO application that acts as a BLE b
   - **GATT Bridge**: Subscribes to TX notifications (`6e400003-...`) and forwards to all TCP / WebSocket clients.
 
 - **Dual Network Transports & Web Console**:
-  - **Interactive Web Console & Dashboard (Ports `80` & `5000`)**: Full in-browser web app with live LoRa mesh chat, node queries, beacon broadcast, time sync, battery monitor, live protocol packet inspector, and Bluetooth configuration manager.
+  - **Interactive Web Console & Dashboard (Port `80`)**: Full in-browser web app with live LoRa mesh chat, node queries, beacon broadcast, time sync, battery monitor, live protocol packet inspector, and Bluetooth configuration manager.
   - **Raw TCP Server (Port `5000`)**: Standard MeshCore framing (`<` for TX, `>` for RX) for native apps and CLI clients.
   - **WebSocket Server (Port `5001`)**: Binary WebSocket transport for Web browsers (MeshCore Open Web).
 
 - **WiFi Configuration**:
   - **WiFi Station Mode**: Configurable SSID and Password in `src/main.cpp`.
   - **Power-Save Disabled**: Zero-latency packet processing (`WiFi.setSleep(false)`).
-  - **mDNS Responder**: Reachable via `http://meshcore-ble-bridge.local` or `meshcore-ble-bridge.local:5000`.
+  - **mDNS Responder**: Reachable via `http://meshcore-ble-bridge.local`.
 
 ---
 
@@ -30,8 +30,8 @@ This repository contains an ESP32-C3 PlatformIO application that acts as a BLE b
 
 | Service | Port | Endpoint | Purpose |
 | :--- | :--- | :--- | :--- |
-| **Web Console & Chat** | `80` / `5000` | `http://<device-ip>:5000/` or `http://meshcore-ble-bridge.local` | Live Web UI & LoRa mesh chat console |
-| **Status API** | `80` / `5000` | `http://<device-ip>:5000/status` | JSON telemetry endpoint |
+| **Web Console & Chat** | `80` | `http://<device-ip>/` or `http://meshcore-ble-bridge.local` | Live Web UI & LoRa mesh chat console |
+| **Status API** | `80` | `http://<device-ip>/status` | JSON telemetry endpoint |
 | **Native TCP** | `5000` | `<device-ip>:5000` | MeshCore Companion TCP protocol |
 | **WebSocket** | `5001` | `ws://<device-ip>:5001` | Browser WebSocket transport for Web Client |
 
