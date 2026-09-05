@@ -19,6 +19,9 @@
 #endif
 #include <Preferences.h>
 #include <vector>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/queue.h>
 #include "dashboard_html.h"
 
 // ================= Configuration =================
@@ -36,6 +39,13 @@
 #define USB_SERIAL_TX_FRAME_START 0x3c // '<'
 #define USB_SERIAL_RX_FRAME_START 0x3e // '>'
 
+// BLE incoming frame queue structure
+struct BleFrame {
+    uint8_t data[MAX_FRAME_SIZE];
+    size_t len;
+};
+static QueueHandle_t bleRxQueue = nullptr;
+
 // Discovered BLE device structure
 struct DiscoveredDevice {
     String address;
@@ -48,6 +58,7 @@ struct DiscoveredDevice {
 
 // ================= State Variables =================
 static std::vector<DiscoveredDevice> discoveredDevices;
+static SemaphoreHandle_t devicesMutex = nullptr;
 static Preferences preferences;
 
 // Wi-Fi & Soft AP Portal State
@@ -65,6 +76,11 @@ static uint32_t configuredPinCode = DEFAULT_BLE_PIN;
 static bool autoConnectEnabled = true;
 static bool bleScanning = false;
 static unsigned long scanStartTime = 0;
+static unsigned long lastScanAttempt = 0;
+static unsigned long scanBackoffInterval = 10000;
+const unsigned long MIN_SCAN_BACKOFF = 10000;
+const unsigned long MAX_SCAN_BACKOFF = 60000;
+const unsigned long SCAN_BACKOFF_STEP = 10000;
 
 static BLEAddress* pTargetAddress = nullptr;
 static BLEClient* pClient = nullptr;
@@ -188,8 +204,12 @@ static void onBLETxNotify(
     blePacketsRx++;
     Serial.printf("[BLE -> BRIDGE] Got %d bytes (code 0x%02X)\n", length, pData[0]);
 
-    // Forward to all active TCP and WebSocket clients
-    broadcastFrameToClients(pData, length);
+    if (bleRxQueue != nullptr) {
+        BleFrame frame;
+        memcpy(frame.data, pData, length);
+        frame.len = length;
+        xQueueSend(bleRxQueue, &frame, 0);
+    }
 }
 
 // ================= BLE Client Callbacks =================
@@ -199,6 +219,11 @@ class BridgeClientCallbacks : public BLEClientCallbacks {
         bleConnected = true;
         bleConnecting = false;
         bleConnectTime = millis();
+        scanBackoffInterval = MIN_SCAN_BACKOFF;
+        if (bleConnected && bleScanning) {
+            BLEDevice::getScan()->stop();
+            bleScanning = false;
+        }
     }
     void onDisconnect(BLEClient* pclient) override {
         Serial.println("[BLE] Disconnected from MeshCore device!");
@@ -206,13 +231,20 @@ class BridgeClientCallbacks : public BLEClientCallbacks {
         bleConnecting = false;
         pRxCharacteristic = nullptr;
         pTxCharacteristic = nullptr;
+        scanBackoffInterval = MIN_SCAN_BACKOFF;
+        lastScanAttempt = millis();
     }
 };
 
 // ================= BLE Advertised Device Callbacks =================
 static void onScanComplete(BLEScanResults scanResults) {
     bleScanning = false;
-    Serial.printf("[SCAN] Scan complete. Total discovered devices: %d\n", (int)discoveredDevices.size());
+    int count = 0;
+    if (devicesMutex && xSemaphoreTake(devicesMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        count = (int)discoveredDevices.size();
+        xSemaphoreGive(devicesMutex);
+    }
+    Serial.printf("[SCAN] Scan complete. Total discovered devices: %d\n", count);
 }
 
 class BridgeAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
@@ -242,28 +274,31 @@ class BridgeAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
         bool isCandidate = hasUUID || matchName;
 
         bool found = false;
-        for (auto& dev : discoveredDevices) {
-            if (dev.address.equalsIgnoreCase(addr)) {
-                found = true;
-                if (name.length() > 0 && dev.name.length() == 0) {
-                    dev.name = name;
+        if (devicesMutex && xSemaphoreTake(devicesMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            for (auto& dev : discoveredDevices) {
+                if (dev.address.equalsIgnoreCase(addr)) {
+                    found = true;
+                    if (name.length() > 0 && dev.name.length() == 0) {
+                        dev.name = name;
+                    }
+                    dev.rssi = rssi;
+                    dev.isMeshCandidate = dev.isMeshCandidate || isCandidate;
+                    dev.hasServiceUUID = dev.hasServiceUUID || hasUUID;
+                    dev.lastSeen = millis();
+                    break;
                 }
-                dev.rssi = rssi;
-                dev.isMeshCandidate = dev.isMeshCandidate || isCandidate;
-                dev.hasServiceUUID = dev.hasServiceUUID || hasUUID;
-                dev.lastSeen = millis();
-                break;
             }
-        }
-        if (!found && discoveredDevices.size() < 60) {
-            DiscoveredDevice d;
-            d.address = addr;
-            d.name = name;
-            d.rssi = rssi;
-            d.isMeshCandidate = isCandidate;
-            d.hasServiceUUID = hasUUID;
-            d.lastSeen = millis();
-            discoveredDevices.push_back(d);
+            if (!found && discoveredDevices.size() < 60) {
+                DiscoveredDevice d;
+                d.address = addr;
+                d.name = name;
+                d.rssi = rssi;
+                d.isMeshCandidate = isCandidate;
+                d.hasServiceUUID = hasUUID;
+                d.lastSeen = millis();
+                discoveredDevices.push_back(d);
+            }
+            xSemaphoreGive(devicesMutex);
         }
 
         // Auto-connect to configured target MAC if set and enabled
@@ -273,6 +308,7 @@ class BridgeAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
                               name.c_str(), addr.c_str(), rssi);
                 BLEDevice::getScan()->stop();
                 bleScanning = false;
+                scanBackoffInterval = MIN_SCAN_BACKOFF;
                 if (pTargetAddress) delete pTargetAddress;
                 pTargetAddress = new BLEAddress(advertisedDevice.getAddress());
                 bleConnectedDeviceName = name.length() > 0 ? name : "MeshCore Device";
@@ -291,7 +327,10 @@ void startBLEScan(int durationSec, bool clearList) {
         delay(50);
     }
     if (clearList) {
-        discoveredDevices.clear();
+        if (devicesMutex && xSemaphoreTake(devicesMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            discoveredDevices.clear();
+            xSemaphoreGive(devicesMutex);
+        }
     }
     Serial.printf("[BLE] Starting background scan for %d seconds...\n", durationSec);
     pScan->clearResults();
@@ -497,6 +536,11 @@ bool connectToMeshCoreDevice() {
 
     bleConnected = true;
     bleConnecting = false;
+    scanBackoffInterval = MIN_SCAN_BACKOFF;
+    if (bleConnected && bleScanning) {
+        BLEDevice::getScan()->stop();
+        bleScanning = false;
+    }
     return true;
 }
 
@@ -721,14 +765,19 @@ String getDevicesJSON() {
     json += "\"connected_mac\":\"" + sanitizeJSONString(bleConnected ? bleConnectedAddress : "") + "\",";
     json += "\"connected_name\":\"" + sanitizeJSONString(bleConnected ? bleConnectedDeviceName : "") + "\",";
     json += "\"devices\":[";
-    for (size_t i = 0; i < discoveredDevices.size(); i++) {
+    std::vector<DiscoveredDevice> devList;
+    if (devicesMutex && xSemaphoreTake(devicesMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        devList = discoveredDevices;
+        xSemaphoreGive(devicesMutex);
+    }
+    for (size_t i = 0; i < devList.size(); i++) {
         if (i > 0) json += ",";
         json += "{";
-        json += "\"address\":\"" + sanitizeJSONString(discoveredDevices[i].address) + "\",";
-        json += "\"name\":\"" + sanitizeJSONString(discoveredDevices[i].name) + "\",";
-        json += "\"rssi\":" + String(discoveredDevices[i].rssi) + ",";
-        json += "\"is_mesh\":" + String(discoveredDevices[i].isMeshCandidate ? "true" : "false") + ",";
-        json += "\"connected\":" + String(bleConnected && bleConnectedAddress.equalsIgnoreCase(discoveredDevices[i].address) ? "true" : "false");
+        json += "\"address\":\"" + sanitizeJSONString(devList[i].address) + "\",";
+        json += "\"name\":\"" + sanitizeJSONString(devList[i].name) + "\",";
+        json += "\"rssi\":" + String(devList[i].rssi) + ",";
+        json += "\"is_mesh\":" + String(devList[i].isMeshCandidate ? "true" : "false") + ",";
+        json += "\"connected\":" + String(bleConnected && bleConnectedAddress.equalsIgnoreCase(devList[i].address) ? "true" : "false");
         json += "}";
     }
     json += "]}";
@@ -847,7 +896,10 @@ void handleDeleteBond() {
 
 void handleClearDiscoveredCache() {
     httpServer.sendHeader("Access-Control-Allow-Origin", "*");
-    discoveredDevices.clear();
+    if (devicesMutex && xSemaphoreTake(devicesMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        discoveredDevices.clear();
+        xSemaphoreGive(devicesMutex);
+    }
     BLEDevice::getScan()->clearResults();
     Serial.println("[SCAN] Cleared discovered devices cache.");
     httpServer.send(200, "application/json", "{\"status\":\"Discovered devices cache cleared\"}");
@@ -896,11 +948,14 @@ void handleConnect() {
     if (pTargetAddress) delete pTargetAddress;
     pTargetAddress = new BLEAddress(address.c_str());
     bleConnectedDeviceName = address;
-    for (const auto& dev : discoveredDevices) {
-        if (dev.address.equalsIgnoreCase(address) && dev.name.length() > 0) {
-            bleConnectedDeviceName = dev.name;
-            break;
+    if (devicesMutex && xSemaphoreTake(devicesMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        for (const auto& dev : discoveredDevices) {
+            if (dev.address.equalsIgnoreCase(address) && dev.name.length() > 0) {
+                bleConnectedDeviceName = dev.name;
+                break;
+            }
         }
+        xSemaphoreGive(devicesMutex);
     }
     bleConnectedAddress = address;
     bleConnecting = true;
@@ -1001,6 +1056,12 @@ void setup() {
     Serial.printf("  ESP32-C3 MeshCore BLE Bridge v%s\n", BRIDGE_VERSION);
     Serial.println("========================================");
 
+    // Initialize FreeRTOS mutex for discovered devices list
+    devicesMutex = xSemaphoreCreateMutex();
+
+    // Initialize BLE incoming RX queue
+    bleRxQueue = xQueueCreate(16, sizeof(BleFrame));
+
     // 1. Load preferences from NVS
     loadPreferences();
 
@@ -1080,14 +1141,13 @@ void setup() {
     BLEScan* pBLEScan = BLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new BridgeAdvertisedDeviceCallbacks());
     pBLEScan->setActiveScan(true);
-    pBLEScan->setInterval(100);
-    pBLEScan->setWindow(99);
+    pBLEScan->setInterval(160);
+    pBLEScan->setWindow(40);
 
     Serial.println("[BLE] Starting initial discovery scan...");
     startBLEScan(5, true);
 }
 
-static unsigned long lastScanAttempt = 0;
 static unsigned long lastStatusPrint = 0;
 static unsigned long lastWiFiCheck = 0;
 
@@ -1110,7 +1170,15 @@ void loop() {
         }
     }
 
-    // 2. Handle WebSockets (port 5001)
+    // 2. Drain incoming BLE frames and broadcast to connected clients safely in main thread
+    if (bleRxQueue != nullptr) {
+        BleFrame frame;
+        while (xQueueReceive(bleRxQueue, &frame, 0) == pdTRUE) {
+            broadcastFrameToClients(frame.data, frame.len);
+        }
+    }
+
+    // 3. Handle WebSockets (port 5001)
     wsServer.loop();
 
     // 3. Handle incoming TCP connections (port 5000)
@@ -1142,18 +1210,31 @@ void loop() {
     if (bleConnecting) {
         if (connectToMeshCoreDevice()) {
             Serial.println("[BLE] Connection established and ready to bridge!");
+            scanBackoffInterval = MIN_SCAN_BACKOFF;
         } else {
-            Serial.println("[BLE] Connection attempt failed, will retry scan in 5 seconds...");
+            Serial.println("[BLE] Connection attempt failed, will retry scan...");
             delay(1000);
             bleConnecting = false;
+            lastScanAttempt = millis();
         }
     } else if (!bleConnected) {
         if (autoConnectEnabled && configuredTargetMac.length() > 0) {
-            if (millis() - lastScanAttempt > 10000 && !bleScanning) {
+            if (millis() - lastScanAttempt > scanBackoffInterval && !bleScanning) {
                 lastScanAttempt = millis();
+                Serial.printf("[BLE] Offline reconnect scan attempt (interval: %lu ms, backoff: %lu s)...\n",
+                              scanBackoffInterval, scanBackoffInterval / 1000);
                 startBLEScan(5, false);
+                if (scanBackoffInterval < MAX_SCAN_BACKOFF) {
+                    scanBackoffInterval = min(MAX_SCAN_BACKOFF, scanBackoffInterval + SCAN_BACKOFF_STEP);
+                }
             }
         }
+    }
+
+    // Ensure background discovery scans are immediately stopped if BLE is connected
+    if (bleConnected && bleScanning) {
+        BLEDevice::getScan()->stop();
+        bleScanning = false;
     }
 
     // Scan timeout watchdog
