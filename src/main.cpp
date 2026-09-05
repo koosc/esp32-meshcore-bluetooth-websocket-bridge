@@ -19,6 +19,8 @@
 #endif
 #include <Preferences.h>
 #include <vector>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 
 // ================= Configuration =================
 #define BRIDGE_VERSION            "1.5.0"
@@ -34,6 +36,13 @@
 #define MAX_FRAME_SIZE            172
 #define USB_SERIAL_TX_FRAME_START 0x3c // '<'
 #define USB_SERIAL_RX_FRAME_START 0x3e // '>'
+
+// BLE incoming frame queue structure
+struct BleFrame {
+    uint8_t data[MAX_FRAME_SIZE];
+    size_t len;
+};
+static QueueHandle_t bleRxQueue = nullptr;
 
 // Discovered BLE device structure
 struct DiscoveredDevice {
@@ -188,8 +197,12 @@ static void onBLETxNotify(
     blePacketsRx++;
     Serial.printf("[BLE -> BRIDGE] Got %d bytes (code 0x%02X)\n", length, pData[0]);
 
-    // Forward to all active TCP and WebSocket clients
-    broadcastFrameToClients(pData, length);
+    if (bleRxQueue != nullptr) {
+        BleFrame frame;
+        memcpy(frame.data, pData, length);
+        frame.len = length;
+        xQueueSend(bleRxQueue, &frame, 0);
+    }
 }
 
 // ================= BLE Client Callbacks =================
@@ -1772,6 +1785,9 @@ void setup() {
     Serial.printf("  ESP32-C3 MeshCore BLE Bridge v%s\n", BRIDGE_VERSION);
     Serial.println("========================================");
 
+    // Initialize BLE incoming RX queue
+    bleRxQueue = xQueueCreate(16, sizeof(BleFrame));
+
     // 1. Load preferences from NVS
     loadPreferences();
 
@@ -1881,7 +1897,15 @@ void loop() {
         }
     }
 
-    // 2. Handle WebSockets (port 5001)
+    // 2. Drain incoming BLE frames and broadcast to connected clients safely in main thread
+    if (bleRxQueue != nullptr) {
+        BleFrame frame;
+        while (xQueueReceive(bleRxQueue, &frame, 0) == pdTRUE) {
+            broadcastFrameToClients(frame.data, frame.len);
+        }
+    }
+
+    // 3. Handle WebSockets (port 5001)
     wsServer.loop();
 
     // 3. Handle incoming TCP connections (port 5000)
